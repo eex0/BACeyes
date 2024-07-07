@@ -1,5 +1,5 @@
 # BACee
-Modular, Python BACnet BBMD's communication and COV subscription management System.
+Modular BACnet BBMD's communication and COV subscription management System.
 
 uses: bacpypes - https://github.com/JoelBender/bacpypes
 
