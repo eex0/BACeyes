@@ -1,7 +1,7 @@
 # BACee
 
-# Modular BACnet Communication for BBMD Devices for mid to lrg networks: uses bacpypes
-# this code provides a framework for BACnet communication and COV subscription reporting. 
+# Modular BACnet Communication for BBMD Devices: uses bacpypes
+# this code provides a framework for BACnet communication and COV subscription management. 
 # It allows you to discover BBMDs, monitor BACnet objects for changes, and receive 
 # notifications when property values change...
 
