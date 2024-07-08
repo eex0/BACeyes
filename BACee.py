@@ -7,40 +7,48 @@
 
 # MIT License - 2024 by: eex0
 
-import bacpypes3
+import asyncio
 import logging
-import threading
 import time
 
-from bacpypes3.object import get_datatype, PropertyIdentifier, ObjectType
-from bacpypes3.apdu import (
-    WhoIsRequest, IAmRequest, SubscribeCOVRequest,
-    ConfirmedCOVNotificationRequest, SimpleAckPDU,
-    ReadPropertyRequest, WritePropertyRequest, ReadPropertyACK,
-    Error, ReadPropertyMultipleRequest, PropertyValue
-)
-from bacpypes3.primitivedata import Unsigned
 from bacpypes3.app import BIPSimpleApplication
-from bacpypes3.service.cov import ChangeOfValueServices
-from bacpypes3.errors import DecodingError, CommunicationError, ExecutionError, BACnetError, TimeoutError
 from bacpypes3.constructeddata import ArrayOf
-from bacpypes3.core import deferred, run
+from bacpypes3.core import run, stop
 from bacpypes3.iocb import IOCB
-from bacpypes3.local.device import LocalDeviceObject
 from bacpypes3.pdu import Address
+from bacpypes3.local.device import LocalDeviceObject
+from bacpypes3.object import get_datatype, PropertyIdentifier, AnalogValueObject
+from bacpypes3.apdu import (
+    Error,
+    IAmRequest,
+    ReadPropertyACK,
+    ReadPropertyRequest,
+    SimpleAckPDU,
+    SubscribeCOVRequest,
+    WhoIsRequest,
+    WritePropertyRequest,
+    ConfirmedCOVNotificationRequest,
+    PropertyValue,
+)
+from bacpypes3.primitivedata import Real, Unsigned
+from bacpypes3.errors import DecodingError, ExecutionError
 
-# Logging configuration
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Create a logger
+_logger = logging.getLogger(__name__)
+_logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
+_logger.addHandler(handler)
 
-# Global lock for thread safety
-subscription_lock = threading.Lock()
+# Local Device definition
+DEVICE_ID = 123
+DEVICE_NAME = 'MyDevice'
+LOCAL_ADDRESS = '192.168.1.100/24'  # Replace with your device's IP
+BBMD_ADDRESS = '192.168.1.255'  # Replace with your BBMD's IP
 
-class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
-    """
-    BACnet application for device discovery, COV subscriptions, and property operations.
-    """
-    def __init__(self, device_name, device_id, local_address, bbmd_address=None):
+class COVClient(BIPSimpleApplication):
+    def __init__(self, local_address, bbmd_address, device_id, device_name, **kwargs):
         device = LocalDeviceObject(
             objectName=device_name,
             objectIdentifier=('device', device_id),
@@ -48,532 +56,344 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
             segmentationSupported='segmentedBoth',
             vendorIdentifier=15,
         )
+        super().__init__(device, Address(local_address))
 
-        BIPSimpleApplication.__init__(self, device, Address(local_address))
-        ChangeOfValueServices.__init__(self)
+        # Keep track of discovered devices and COV subscriptions
+        self.discovered_devices = []
+        self.subscriptions = {}
+        self.subscription_lock = asyncio.Lock()
+        self.obj_value = {}
 
-        self.object_values = {}
-        self.cov_subscriptions = {}
-        self.discoveredDevices = []
-        self._value_check_timer = None
+        # Configure BBMD if provided
+        if bbmd_address:
+            self.who_is(destination=Address(bbmd_address))
 
-    def do_WhoIsRequest(self, apdu):
-        """Respond to Who-Is requests to support BBMD and device discovery."""
-        self.logger.info(f"Received Who-Is Request from {apdu.pduSource}")
+    async def do_IAmRequest(self, apdu):
+        """Process received I-Am requests."""
+        _logger.debug("Received I-Am Request")
+        device_info = {
+            'device_id': apdu.iAmDeviceIdentifier,
+            'device_address': apdu.pduSource,
+            'device_name': apdu.objectName,
+            'max_apdu_length_accepted': apdu.maxApduLengthAccepted,
+            'segmentation_supported': apdu.segmentationSupported,
+            'vendor_id': apdu.vendorID,
+        }
+        self.discovered_devices.append(device_info)
 
-        if self.localAddress is None:  # Only respond if we are not a BBMD
-            self.logger.info(f"Sending I-Am Request for device: {self.this_device.objectName[0].value}")
+    async def do_WhoIsRequest(self, apdu):
+        """Respond to Who-Is requests."""
+        _logger.debug("Received Who-Is Request")
+        # If the device is a BBMD, it will ignore the request
+        if self.localAddress is None:
             self.response(IAmRequest())
 
-    def do_IAmRequest(self, apdu):
-        """Process I-Am requests to track discovered devices."""
-        device_id = apdu.iAmDeviceIdentifier
-        device_address = apdu.pduSource
-        self.logger.info(f"Received I-Am Request from device {device_id} at {device_address}")
-        self.discoveredDevices.append(apdu)
+    async def discover_devices(self):
+        """Discover all devices on the network."""
+        await self.who_is()  # Broadcast a Who-Is request
+        await asyncio.sleep(1)  # Give some time for I-Am responses
 
-    def do_SubscribeCOVRequest(self, apdu):
-        """Handles SubscribeCOVRequests from clients."""
-        self.logger.info("Received SubscribeCOVRequest")
-        obj_id = apdu.monitoredObjectIdentifier
-        confirmed = apdu.issueConfirmedNotifications
-        lifetime = apdu.lifetime
 
-        if obj_id is not None:
-            lifetime_seconds = lifetime.intValueSeconds() if lifetime else None  
-            subscription = {
-                "confirmed": confirmed, 
-                "lifetime": lifetime_seconds, 
-                "source": apdu.pduSource, 
-                "timer": None, 
-                "subscriberProcessIdentifier": apdu.subscriberProcessIdentifier,
-                "property_id": apdu.monitoredPropertyIdentifier,
-                "threshold": apdu.covIncrement.value if apdu.covIncrement else None
-            }
-            with subscription_lock:
-                self.cov_subscriptions.setdefault(obj_id, []).append(subscription)
-
-            try:
-                self.send_ack(SimpleAckPDU(context=apdu)) 
-            except (CommunicationError, BACnetError) as e:
-                self.logger.error(f"Error acknowledging SubscribeCOVRequest: {e}")
-                return 
-
-            if lifetime_seconds is not None:
-                self.schedule_subscription_renewal(obj_id, lifetime_seconds, apdu.subscriberProcessIdentifier)
-
-            if self._value_check_timer is None or not self._value_check_timer.is_alive():
-                self._value_check_timer = threading.Timer(5, self.check_object_values)
-                self._value_check_timer.start()
-        else:
-            self.send_error(Error(errorClass='object', errorCode='unknownObject', context=apdu))
-    def schedule_subscription_renewal(self, obj_id, lifetime_seconds, subscriberProcessIdentifier):
-        """Schedule renewal of a COV subscription."""
-        timer = threading.Timer(lifetime_seconds, self._renew_subscription, args=[obj_id, subscriberProcessIdentifier])
-        with subscription_lock:
-            for i, sub in enumerate(self.cov_subscriptions[obj_id]):
-                if sub['subscriberProcessIdentifier'] == subscriberProcessIdentifier: 
-                    self.cov_subscriptions[obj_id][i]["timer"] = timer
-                    break
-        timer.start()
-        logger.info(f"Scheduled COV subscription renewal for {obj_id} in {lifetime_seconds} seconds")
-
-    def _renew_subscription(self, obj_id, subscriberProcessIdentifier):
-        """Renew a COV subscription."""
-        self.logger.info(f"Renewing subscription for object: {obj_id}")
-        with subscription_lock:
-            subscriptions = self.cov_subscriptions.get(obj_id)
-            if subscriptions:
-                for i, subscription in enumerate(subscriptions):
-                    if subscription['subscriberProcessIdentifier'] == subscriberProcessIdentifier:
-                        confirmed_notifications = subscription['confirmed']
-                        lifetime_seconds = subscription['lifetime']
-                        pduSource = subscription['source']
-                        try:
-                            self.schedule_subscription_renewal(obj_id, lifetime_seconds, subscriberProcessIdentifier)
-                        except Exception as e:
-                            self.logger.error(f"Error scheduling renewal for object {obj_id}: {e}")
-                            continue
-
-                        if confirmed_notifications:
-                            try:
-                                self.send_cov_notification(
-                                    obj_id,
-                                    self.object_values[obj_id],
-                                    subscriberProcessId=subscriberProcessIdentifier,
-                                    destination=pduSource
-                                )
-                            except Exception as e:
-                                self.logger.error(f"Error sending COV notification for {obj_id}: {e}")
-                        break 
-            else:
-                self.logger.warning(f"Subscription for object {obj_id} not found. Renewal failed.")
-
-    def do_UnsubscribeCOVRequest(self, apdu):
-        """Unsubscribe from COV notifications."""
-        self.logger.info(f"Received UnsubscribeCOVRequest from {apdu.pduSource}")
-        subscriber_process_id = apdu.subscriberProcessIdentifier
-        obj_id = apdu.monitoredObjectIdentifier
-
-        with subscription_lock:
-            if obj_id in self.cov_subscriptions:
-                subscriptions_for_object = self.cov_subscriptions[obj_id]
-                self.cov_subscriptions[obj_id] = [sub for sub in subscriptions_for_object if sub['subscriberProcessIdentifier'] != subscriber_process_id]
-            else:
-                self.logger.warning(f"No subscription found for object {obj_id} with subscriber process ID {subscriber_process_id}")
-
-            if obj_id not in self.cov_subscriptions or not self.cov_subscriptions[obj_id]:
-                if hasattr(self, '_value_check_timer') and self._value_check_timer.is_alive():
-                    self._value_check_timer.cancel()
-                    del self._value_check_timer
-                    self.logger.info(f"Stopped checking object values for {obj_id} as there are no more subscriptions")
-
-        self.send_ack(SimpleAckPDU(context=apdu)) 
+    async def subscribe_cov(self, device_id, obj_id, property_identifier, confirmed_notifications=True, lifetime_seconds=None):
+        """Subscribe to COV notifications for a property."""
+        request = SubscribeCOVRequest(
+            subscriberProcessIdentifier=0,  # Assuming only one subscriber for this example
+            monitoredObjectIdentifier=obj_id,
+            issueConfirmedNotifications=confirmed_notifications,
+            lifetime=Unsigned(lifetime_seconds) if lifetime_seconds is not None else None,
+            monitoredPropertyIdentifier=property_identifier,
+        )
         
-    def check_object_values(self):
-        """Periodically check object values for changes and send notifications."""
-        if self._value_check_timer: 
-            threading.Timer(5, self.check_object_values).start() 
-
-        with subscription_lock: 
-            for obj_id, subscriptions in self.cov_subscriptions.items():
-                for subscription in subscriptions:
-                    try:
-                        property_id = subscription.get('property_id')
-                        # Read the property and validate the result
-                        result = self.read_property(obj_id, property_id)
-                        if result is not None:
-                            # If it's a sequence, get the first value
-                            if isinstance(result, bacpypes3.constructeddata.Sequence):
-                                result = result[0]
-                            # Compare the new value with the stored value
-                            if obj_id not in self.object_values or abs(result - self.object_values.get(obj_id)) >= subscription.get('threshold', 0.01):
-                                self.object_values[obj_id] = result
-
-                                confirmed_notifications, _, pduSource, _, subscriberProcessId = subscription
-                                if confirmed_notifications:
-                                    # Send the COV notification
-                                    self.send_cov_notification(
-                                        obj_id,
-                                        result,
-                                        subscriberProcessId=subscriberProcessId,
-                                        destination=pduSource
-                                    )
-                    except (CommunicationError, BACnetError) as e:
-                        self.logger.error(f"Error checking or sending notification for {obj_id}/{property_id}: {e}")
-
-
-    def send_cov_notification(self, obj_id, value, subscriberProcessId, destination):
-        """Send a confirmed COV notification."""
-        try:
-            apdu = ConfirmedCOVNotificationRequest(
-                subscriberProcessIdentifier=subscriberProcessId,
-                initiatingDeviceIdentifier=self.this_device.objectIdentifier,
-                monitoredObjectIdentifier=obj_id,
-                timeRemaining=Unsigned(60)  
-            )
-            datatype = get_datatype(obj_id[0], "presentValue")  
-            apdu.listOfValues = ArrayOf(PropertyValue) 
-            apdu.listOfValues.append(
-                PropertyValue(
-                    propertyIdentifier=("presentValue",),
-                    value=ArrayOf(datatype)([value])
-                )
-            )
-            # Send the APDU
-            self.logger.info(f"Sending ConfirmedCOVNotificationRequest to {destination} for {obj_id}")
-            self.request(apdu, destination)
-        except Exception as e:  
-            self.logger.error(f"Error sending COV notification for {obj_id}: {e}")
-
-    def do_ReadPropertyRequest(self, apdu):
-        """Handle ReadProperty requests."""
-        try:
-            obj_id = apdu.objectIdentifier
-            prop_id = apdu.propertyIdentifier
-            # Check if reading multiple properties
-            if (
-                isinstance(prop_id, bacpypes3.constructeddata.SequenceOf) and
-                prop_id[0].propertyIdentifier == bacpypes3.object.PropertyIdentifier.all
-            ):
-                self.read_multiple_properties(apdu)  # Handle multiple property reads
-                return
-
-            result = self.read(f'{obj_id}/{prop_id}')
-            if result:
-                ack = ReadPropertyACK(context=apdu)
-                ack.objectIdentifier = obj_id
-                ack.propertyIdentifier = prop_id
-                ack.propertyValue = result.propertyValue
-                self.response(ack)
-            else:
-                raise ExecutionError(errorClass='property', errorCode='unknownProperty') 
-        except (ValueError, DecodingError, CommunicationError, BACnetError) as e:
-            self.logger.error(f"Error in ReadPropertyRequest: {e}")
-            # More specific error handling based on exception type
-            if isinstance(e, ExecutionError):
-                error_code = e.errorCode
-            elif isinstance(e, BACnetError):
-                error_code = e.error_code
-            else:
-                error_code = 'other' 
-            self.response(Error(errorClass='property', errorCode=error_code, context=apdu))
-    def read_multiple_properties(self, apdu):
-        """Handles ReadPropertyMultiple requests."""
-        try:
-            obj_id = apdu.objectIdentifier
-            # Assuming that the request is for "all" properties
-            if (
-                isinstance(apdu.propertyIdentifierList, bacpypes3.constructeddata.SequenceOf) and
-                apdu.propertyIdentifierList[0].propertyIdentifier == bacpypes3.object.PropertyIdentifier.all
-            ):
-                # Get the class of the object and then get all of its properties
-                obj = self.get_object_by_id(obj_id)
-                if obj is not None:
-                    props = [(bacpypes3.object.PropertyIdentifier(prop), obj.properties[prop].ReadProperty(obj, obj.properties[prop])) for prop in obj.properties]
-                else:
-                    raise BACnetError(f"Unknown object {obj_id}")
-            else:
-                # If not "all" properties then only read the requested properties.
-                props = [(bacpypes3.object.PropertyIdentifier(prop), None) for prop in apdu.propertyIdentifierList]
-        except (BACnetError, ValueError) as e:
-            self.logger.error(f"Error in ReadPropertyMultiple: {e}")
-            self.response(Error(errorClass='property', errorCode='unknownProperty', context=apdu))
-            return
+        # Create an IOCB to track the request
+        iocb = IOCB(request)
+        iocb.set_destination(Address(device_id))  # Set the destination address for the request
 
         try:
-            iocb = self.readMultiple(
-                obj_id,
-                props
-            )
-            iocb.wait()
-            if iocb.ioResponse:
-                self.response(iocb.ioResponse)
-            else:
-                self.logger.error(f"Failed to read multiple properties from {obj_id}")
+            await self.request_io(iocb)
+            response = iocb.ioResponse
+            if not isinstance(response, SimpleAckPDU):
+                raise ValueError("Failed to subscribe to COV, response was not SimpleAckPDU")
+
+            _logger.info(f"Subscribed to COV notifications for {obj_id}.{property_identifier}")
+
+            async with self.subscription_lock:
+                self.subscriptions.setdefault(obj_id, []).append(property_identifier)
+                self.start_subscription_renewal_task(obj_id, property_identifier, lifetime_seconds)
         except Exception as e:
-            self.logger.error(f"Exception during readMultiple operation: {e}")
-            self.response(Error(errorClass='services', errorCode='inconsistentSelection', context=apdu))
+            _logger.error(f"Failed to subscribe to COV notifications: {e}")
 
-    def do_WritePropertyRequest(self, apdu):
-        """Handle WriteProperty requests."""
-        try:
-            obj_id = apdu.objectIdentifier
-            prop_id = apdu.propertyIdentifier
+def start_subscription_renewal_task(self, obj_id, property_identifier, lifetime_seconds, device_id):
+    """Starts a background task to renew the COV subscription periodically."""
+    async def renew_subscription():
+        """
+        Coroutine that handles subscription renewal.
+        """
+        while True:
+            try:
+                await asyncio.sleep(lifetime_seconds)  # Wait for the lifetime duration
+                _logger.info(f"Renewing COV subscription for {obj_id}.{property_identifier}")
+                try:
+                    # Pass the device_id to subscribe_cov
+                    await self.subscribe_cov(device_id, obj_id, property_identifier, lifetime_seconds=lifetime_seconds)
+                    _logger.info(f"Renewed COV subscription for {obj_id}.{property_identifier}")
+                except Exception as e:
+                    _logger.error(f"Failed to renew subscription: {e}")
+                    # Optionally, you can add retry logic here
 
-            value = apdu.propertyValue
-            result = self.write(f'{obj_id}/{prop_id}', value)
-            if result:
-                self.response(SimpleAckPDU(context=apdu))
-            else:
-                raise ExecutionError(errorClass='property', errorCode='writeAccessDenied')
-        except (ValueError, DecodingError, CommunicationError, BACnetError) as e:
-            self.logger.error(f"Error in WritePropertyRequest: {e}")
-            # More specific error handling based on exception type
-            if isinstance(e, ExecutionError):
-                error_code = e.errorCode
-            elif isinstance(e, BACnetError):
-                error_code = e.error_code
-            else:
-                error_code = 'other' 
-            self.response(Error(errorClass='property', errorCode=error_code, context=apdu))
+            except asyncio.CancelledError:
+                _logger.info(f"Subscription renewal task for {obj_id}.{property_identifier} cancelled.")
+                break  # Exit the loop if the task is cancelled
 
-class BACnetClient:
-    def __init__(self, bbmd_address, device_name='Custom-Client', device_id=1234):
-        self.bbmd_address = bbmd_address
-        self.app = CustomCOVApplication(device_name, device_id, bacpypes3.local.BIPLocalAddress(), bbmd_address)
-        self.logger = logging.getLogger(__name__)
-        self.devices = []
+    # Store the task so you can cancel it later if needed
+    self.renewal_tasks[(obj_id, property_identifier)] = asyncio.create_task(renew_subscription())
 
-    def discover_devices(self) -> list[dict]:
-        """Discover BACnet devices through the BBMD."""
-        self.logger.info("Discovering devices...")
-        who_is = WhoIsRequest()
-        self.app.request(who_is)
-        # Add a small delay to allow for responses
-        deferred(self._get_discovered_devices, 1.0)
-        return self.devices
 
-    def _get_discovered_devices(self):
-        """Store Discovered devices in a list"""
-        self.devices = []  # Reset the devices list before re-populating
-        for device in self.app.discoveredDevices:
-            device_dict = {
-                'device_id': device.iAmDeviceIdentifier,
-                'device_address': device.pduSource,
-                'device_name': device.objectName,
-                'max_apdu_length_accepted': device.maxApduLengthAccepted,
-                'segmentation_supported': device.segmentationSupported,
-                'vendor_id': device.vendorID,
-            }
-            self.devices.append(device_dict)
 
-    def read_property(self, object_identifier, property_id):
-        """Reads a property from a BACnet object."""
-        try:
-            iocb = self.app.read(
-                f'{object_identifier}/{property_id}'
-            )
-            if iocb.ioResponse:
-                apdu = iocb.ioResponse
-                if not isinstance(apdu, ReadPropertyACK):
-                    raise ValueError(f"ReadProperty did not succeed, got: {apdu}")
-                # Here you extract the value from the APDU
-                return apdu.propertyValue[0].value[0]
-            else:
-                # Check for other errors like Abort or Reject
-                if iocb.ioError:
-                    self.logger.error(f"Error reading property: {iocb.ioError}")
-        except (CommunicationError, BACnetError, TimeoutError) as e:
-            self.logger.error(f"Error reading property: {e}")
-        return None  # Return None on error or timeout
-
-    def write_property(self, obj_id, prop_id, value):
-        """Writes a property to a BACnet object."""
-        try:
-            obj = self.app.get_object_by_id(obj_id)
-            if obj is not None:
-                datatype = get_datatype(obj.objectType, prop_id)
-                if not datatype:
-                    raise ValueError("invalid property for object")
-
-                value = bacpypes3.primitivedata.encode_application_data(value, datatype)
-
-                # build a request
-                request = WritePropertyRequest(
-                    objectIdentifier=obj_id,
-                    propertyIdentifier=prop_id
+    async def read_properties(self, device_id, obj_id, property_identifiers):
+        """Read multiple properties from a device."""
+        # Creating tasks for each property
+        tasks = []
+        for prop_id in property_identifiers:
+            tasks.append(
+                asyncio.create_task(
+                    self.read_property(device_id, *obj_id, prop_id)
                 )
-                request.propertyValue = Any()
-                request.propertyValue.cast_in(value)
+            )
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # optional parameters
-                request.priority = Unsigned(16)
+        return_dict = {}
+        for prop_id, value in zip(property_identifiers, results):
+            if isinstance(value, Exception):
+                _logger.error(f"Error reading property {prop_id} from {obj_id}: {value}")
+            else:
+                return_dict[prop_id] = value
 
-                # Add error handling for timeout
-                iocb = IOCB(request)
-                iocb.set_timeout(10) # 10 seconds
-                self.request_io(iocb)
-                iocb.wait()  
+        return return_dict
 
-                # do something for success
-                if iocb.ioResponse:
-                    apdu = iocb.ioResponse
-                    self.logger.info(f"WriteProperty: {apdu}")
+
+    async def check_writable_properties(self, device_id, object_type, object_instance):
+        """Reads the Property List object to determine which properties are writable for a given object."""
+
+        obj_id = (object_type, object_instance)
+        request = ReadPropertyRequest(
+            objectIdentifier=obj_id,
+            propertyIdentifier='propertyList',
+        )
+        iocb = IOCB(request)
+        iocb.set_timeout(10)
+        iocb.set_destination(Address(device_id))  # Set destination for the request
+        task = asyncio.create_task(self.request_io(iocb))
+        await task
+
+        if iocb.ioResponse:
+            apdu = iocb.ioResponse
+            if not isinstance(apdu, ReadPropertyACK):
+                _logger.error("Failed to read propertyList, response was not ReadPropertyACK")
+                return []
+
+            property_identifiers = [prop_id.value for prop_id in apdu.propertyValue[0]]
+            mutable_properties = []
+
+            for prop_id in property_identifiers:
+                # Create a task for each property and gather the results
+                task = asyncio.create_task(self.check_property_writable(device_id, obj_id, prop_id))
+                mutable_properties.append(task)
+
+            writable_props = await asyncio.gather(*mutable_properties)
+            return [prop for prop, is_mutable in zip(property_identifiers, writable_props) if is_mutable]
+        else:
+            _logger.error("Failed to read propertyList")
+            return []  
+
+    async def check_property_writable(self, device_id, obj_id, property_identifier):
+        """Check if the property is writable by reading its property description."""
+        request = ReadPropertyRequest(
+            objectIdentifier=obj_id,
+            propertyIdentifier='propertyDescription'
+        )
+
+        iocb = IOCB(request)
+        iocb.set_timeout(5)  # Set a timeout for the request
+        await self.request_io(iocb)  # Use await here
+
+        if iocb.ioResponse:
+            apdu = iocb.ioResponse
+            if not isinstance(apdu, ReadPropertyACK):
+                _logger.error(
+                    f"Failed to read property description for {obj_id}.{property_identifier}: {apdu}"
+                )
+                return False
+
+            property_description = apdu.propertyValue[0]
+            for item in property_description:
+                if item.propertyIdentifier == "mutable" and item.value[0].value:
                     return True
 
-                # do something for error/reject/abort
-                if iocb.ioError:
-                    self.logger.error(f"WriteProperty: {iocb.ioError}")
-                    return False
-            else:
-                self.logger.error("Object not found on local device.")
-                return False
-        except (ValueError, TypeError) as error:
-            self.logger.error(f"WriteProperty: {error}")
-            return False
-        except Exception as e:
-            self.logger.error(f"WriteProperty: {e}")
-            return False
+        return False
 
-    def subscribe_to_changes(self, object_identifier, property_id, callback=None, confirmed_notifications=True, lifetime=None, threshold=0.01):
-        """Subscribe to COV notifications for the specified object and property."""
-        try:
-            self.app.do_SubscribeCOVRequest(
-                SubscribeCOVRequest(
-                    monitoredObjectIdentifier=object_identifier,
-                    issueConfirmedNotifications=confirmed_notifications,
-                    subscriberProcessIdentifier=0,
-                    lifetime=Unsigned(lifetime) if lifetime else None,
-                    covIncrement=bacpypes3.primitivedata.Real(threshold) if threshold else None
-                )
-            )
-            if callback:
-                self.app.cov_subscriptions.setdefault(object_identifier, []).append({
-                    "property_id": property_id,
-                    "callback": callback,
-                    "subscriberProcessIdentifier": 0,
-                    "threshold": threshold 
-                })
-                logging.info(f"Subscribed to changes for object: {object_identifier}, property: {property_id}")
-        except (CommunicationError, BACnetError) as e:
-            logger.error(f"Error subscribing to changes: {e}")
-            return None
-
-    def get_available_object_properties(self, object_identifier):
-        """
-        Retrieve available properties for a BACnet object.
-        """
-        rp_req = ReadPropertyRequest(
-            objectIdentifier=object_identifier,
-            propertyIdentifier=PropertyIdentifier.propertyList
-        )
-        try:
-            iocb = IOCB(rp_req)
-            self.app.request_io(iocb)
-            iocb.wait()
-            response = iocb.ioResponse
-            if isinstance(response, ReadPropertyACK):
-                property_list = response.propertyValue
-                return [p.propertyIdentifier for p in property_list]
-            else:
-                self.logger.error(f"Failed to read propertyList from {object_identifier}")
-        except (CommunicationError, BACnetError, TimeoutError, AttributeError) as e:
-            self.logger.error(f"Error getting available object properties: {e}")
-        return []  # Return an empty list if properties couldn't be fetched
-
-    def check_property_writable(self, object_identifier, property_identifier):
-        """Check if the property is writable"""
-        rp_req = ReadPropertyRequest(
-            objectIdentifier=object_identifier,
-            propertyIdentifier=PropertyIdentifier.propertyList,
-        )
-        try:
-            iocb = IOCB(rp_req)
-            self.app.request_io(iocb)
-            iocb.wait()
-            response = iocb.ioResponse
-            property_list = [bacpypes3.object.PropertyIdentifier(prop_id) for prop_id in response.propertyList]
-            if property_identifier not in property_list:
-                raise BACnetError(f"propertyIdentifier {property_identifier} not in object {object_identifier}")
-            object = self.app.get_object_by_id(object_identifier)
-            if property_identifier in object.properties and object.properties[property_identifier].mutable:
-                return True
-            else:
-                return False
-        except (CommunicationError, BACnetError, TimeoutError, AttributeError) as e:
-            logging.error(f"Error checking property writable: {e}")
-            return False
-
-def main():
-    # Replace with the actual BBMD address and port
-    bbmd_address = ("your_bbmd_ip_address", 47808)
-
-    # Initialize the client
-    client = BACnetClient(bbmd_address, device_name="BACnetCOVClient", device_id=123) 
-
-    # --- Test Cases ---
-
-    # 1. BBMD and Device Discovery Test:
-    client.app.who_is() 
-    time.sleep(2) 
-    
-    if client.app.discoveredDevices:
-        logging.info("BBMD and Device Discovery Test: PASS")
-
-        # For demonstration, select the first discovered device
-        device = client.app.discoveredDevices[0]
-        object_identifier = device.iAmDeviceIdentifier
-        logging.info(f"Using device: {object_identifier} for property tests")
-
-        # 2. Property Reading Tests:
-        # Test multiple properties for a more comprehensive check
-        properties_to_read = [
-            (PropertyIdentifier.objectName, "Object Name"),
-            (PropertyIdentifier.description, "Description"),
-            (PropertyIdentifier.presentValue, "Present Value"),
-            (PropertyIdentifier.units, "Units"),
-            (PropertyIdentifier.objectType, "Object Type"),
-            # ... add more properties as needed
-        ]
-
-        for prop_id, prop_name in properties_to_read:
-            try:
-                property_value = client.read_property(object_identifier, prop_id)
-                if property_value is not None:
-                    logging.info(f"Property Reading Test ({prop_name}): PASS - Value: {property_value}")
-                else:
-                    logging.warning(f"Property Reading Test ({prop_name}): WARNING - Could not read property from {object_identifier}")
-            except Exception as e: 
-                logging.error(f"Property Reading Test ({prop_name}): FAIL - {e}")
             
-        # 3. Property Writability Check and Writing Test:
-        writable_property = PropertyIdentifier.description  
-        new_description = "Updated description from BACnet Client"
-        if client.check_property_writable(object_identifier, writable_property):
-            if client.write_property(object_identifier, writable_property, new_description):
-                updated_description = client.read_property(object_identifier, writable_property)
-                if updated_description == new_description:
-                    logging.info(f"Property Writing Test: PASS - Wrote new description to object {object_identifier}")
-                else:
-                    logging.error(f"Property Writing Test: FAIL - Written value does not match for object {object_identifier}")
+    async def write_property(self, device_id, obj_id, prop_id, value, priority=None):
+        """Write a property value to a device."""
+
+        # Check property writability first
+        if not await self.check_property_writable(device_id, obj_id, prop_id):
+            _logger.error(f"Property {prop_id} is not writable for object {obj_id}")
+            return
+
+        # Construct the WriteProperty request
+        value = get_datatype(obj_id[0], prop_id)(value)
+        request = WritePropertyRequest(
+            objectIdentifier=obj_id,
+            propertyIdentifier=prop_id,
+            propertyValue=[value],
+        )
+        if priority is not None:
+            request.priority = Unsigned(priority)
+        request.pduDestination = Address(device_id) # set the destination of the request
+
+        # Create an IOCB and send the request
+        iocb = IOCB(request)
+        try:
+            await self.request_io(iocb)
+            response = iocb.ioResponse
+            if not isinstance(response, SimpleAckPDU):
+                raise ValueError("Failed to write property")
+            _logger.info(f"Successfully wrote {value} to {obj_id}.{prop_id}")
+        except Exception as e:
+            _logger.error(f"Failed to write property: {e}")
+
+    def do_ConfirmedCOVNotificationRequest(self, apdu: ConfirmedCOVNotificationRequest) -> None:
+        """Handle COV notifications."""
+        _logger.info(f"Received COV notification: {apdu}")
+        # Get the value from the notification
+        for element in apdu.listOfValues:
+            prop_id = element.propertyIdentifier
+            value = element.value[0]
+
+            # Extract the object identifier
+            obj_id = apdu.monitoredObjectIdentifier
+
+            # Update the stored value for this object
+            self.obj_value[obj_id] = {prop_id[0]:value}  # Create new value dict
+
+            # Call the callback if it's registered
+            # Ensure the callback dictionary exists for this object and property
+            callbacks = self._callbacks.get(obj_id, {}).get(prop_id[0], []) 
+            for callback in callbacks:
+                callback(obj_id, prop_id[0], value)  # Assuming the first element is the property value
+
+
+        # Send an acknowledgement
+        self.response(SimpleAckPDU(context=apdu))
+
+
+async def read_write_subscribe_loop(app, device):
+    """Asynchronous generator to continuously read, write, and subscribe to a device."""
+
+    # Find the first valid object in the device
+    for obj in app.iter_objects(device["device_id"]):
+        obj_identifier = (obj.objectType, obj.objectInstance)
+        if obj is not None:
+            break
+    else:  # No valid object found
+        _logger.error("No valid object found on the device.")
+        return
+
+    while True:
+        _logger.info(f"Working on object: {obj_identifier}")
+
+        # Read all properties of the object
+        props = await app.read_properties(
+            device['device_id'],
+            obj_identifier,
+            [PropertyIdentifier.all]
+        )
+        _logger.info(f"Read properties of the object {obj_identifier}: {props}")
+
+        # Determine writable properties
+        writable_properties = await app.check_writable_properties(
+            device['device_id'],
+            obj_identifier[0],
+            obj_identifier[1]
+        )
+        _logger.info(f"Writable properties for object {obj_identifier}: {writable_properties}")
+
+        # Write to a specific writable property (if it's available)
+        prop_to_write = 'presentValue'  # Replace with the property you want to write
+        if prop_to_write in writable_properties:
+            datatype = get_datatype(obj_identifier[0], prop_to_write)
+            if datatype:
+                value_to_write = datatype(100.5)  # Get input from the user or another source
+                await app.write_property(device['device_id'], obj_identifier, prop_to_write, value_to_write)
             else:
-                logging.error(f"Property Writing Test: FAIL - Could not write to property {writable_property} on object {object_identifier}")
+                _logger.error(f"Invalid data type for property {prop_to_write}")
         else:
-            logging.info(f"Property Writing Test: SKIPPED - Property {writable_property} is not writable on object {object_identifier}")
+            _logger.info(f"Property {prop_to_write} is not writable for object {obj_identifier}")
 
-        # 4. COV Subscription Tests
-        cov_subscriptions = []
+        # Subscribe to changes in the object's presentValue
+        await app.subscribe_cov(
+            device['device_id'], obj_identifier, 'presentValue', lifetime_seconds=300
+        )
+        await asyncio.sleep(1) # pause 1 second before checking next object
 
-        # Confirmed COV Subscription
-        def cov_confirmed_callback(obj_id, prop_id, value):
-            logging.info(f"Confirmed COV Notification: Object {obj_id}, Property {prop_id}, Value: {value}")
 
-        # Ensure you have a list of valid object properties
-        properties_to_subscribe = client.get_available_object_properties(object_identifier)
+async def read_properties(self, device_id, obj_id, property_identifiers):
+    """Read multiple properties from a device."""
+    results = {}
+    for prop_id in property_identifiers:
+        try:
+            value = await self.read_property(device_id, *obj_id, prop_id) # unpacking obj_id
+            if value is not None:
+                results[prop_id] = value
+        except Exception as e:
+            _logger.error(f"Error reading property {prop_id} from {obj_id}: {e}")
+    return results
 
-        # Now subscribe to available properties
-        for prop in properties_to_subscribe:
-            try:
-                cov_subscriptions.append(client.subscribe_to_changes(object_identifier, prop, cov_confirmed_callback, lifetime=60, threshold=0.5))
-            except Exception as e:
-                logging.error(f"Error subscribing to property {prop}: {e}")
+async def main():
+    # ... (initializations and device discovery are the same as before) ...
+    
+    # Choose the first discovered device (you can change this logic)
+    device = app.discovered_devices[0]
 
-        if all(cov_subscriptions):
-            logging.info("COV Subscription Tests: PASS - Subscribed to properties on device")
-            time.sleep(30)  # Adjust wait time as needed for testing
+    # Read all properties of a specific object in the device
+    object_type = 'analogInput'    # Replace with desired object type
+    object_instance = 0           # Replace with desired object instance
+    obj_identifier = (object_type, object_instance)
+
+    # Read the properties of the selected object
+    props = await app.read_properties(device['device_id'], obj_identifier, [PropertyIdentifier.all])
+    _logger.info(f"Read properties of object {obj_identifier}: {props}")
+
+    # Determine writable properties
+    writable_properties = await app.check_writable_properties(device['device_id'], object_type, object_instance)
+    _logger.info(f"Writable properties for object {obj_identifier}: {writable_properties}")
+
+    # Write to a specific writable property (if it's available)
+    prop_to_write = 'presentValue'  # Replace with the property you want to write
+    if prop_to_write in writable_properties:
+        datatype = get_datatype(object_type, prop_to_write)
+        if datatype:
+            value_to_write = datatype(100.5)  # Get input from the user or another source
+            await app.write_property(device['device_id'], obj_identifier, prop_to_write, value_to_write)
         else:
-            logging.error("COV Subscription Tests: FAIL - Could not subscribe to all properties.")
-
-        # 5. Unsubscription Test
-        for sub in cov_subscriptions:
-            client.app.do_UnsubscribeCOVRequest(sub)
-        logging.info("Unsubscription Test: PASS")
-
-        while True:
-            run()  # Keep the BACnet stack running
+            _logger.error(f"Invalid data type for property {prop_to_write}")
     else:
-        logging.error("BBMD and Device Discovery Test: FAIL - No devices or BBMDs found.")
+        _logger.info(f"Property {prop_to_write} is not writable for object {obj_identifier}")
+
+    # Subscribe to changes in the first object's presentValue
+    await app.subscribe_cov(
+        device['device_id'], obj_identifier, 'presentValue', lifetime_seconds=300
+    )
+
+    # Run the BACnet application
+    _logger.debug("Running")
+    while True:  
+        await asyncio.sleep(1)  
+
+    except KeyboardInterrupt:
+        _logger.debug("keyboard interrupt")
+    finally:
+        stop()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
