@@ -1,4 +1,4 @@
-# BACee
+# BACee - uses:bacpypes3
 
 # Modular BACnet Communication for BBMD Devices: uses bacpypes
 # this code provides a framework for BACnet communication and COV subscription management. 
@@ -7,53 +7,49 @@
 
 # MIT License - 2024 by: eex0
 
-import bacpypes
+import bacpypes3
 import logging
 import threading
 import time
 
-from bacpypes.object import validate_object_id
-from bacpypes.apdu import (
+from bacpypes3.object import get_datatype, PropertyIdentifier, ObjectType
+from bacpypes3.apdu import (
     WhoIsRequest, IAmRequest, SubscribeCOVRequest,
     ConfirmedCOVNotificationRequest, SimpleAckPDU,
     ReadPropertyRequest, WritePropertyRequest, ReadPropertyACK,
-    Error, ReadPropertyMultipleRequest
+    Error, ReadPropertyMultipleRequest, PropertyValue
 )
-from bacpypes.primitivedata import Unsigned
-from bacpypes.app import BIPSimpleApplication
-from bacpypes.service.cov import ChangeOfValueServices
-from bacpypes.errors import (
-    DecodingError, CommunicationError, ExecutionError,
-    BACnetError, TimeoutError
-)
-from bacpypes.constructeddata import ArrayOf
-from bacpypes.core import deferred, run
-from bacpypes.iocb import IOCB
-from bacpypes.local.device import LocalDeviceObject
-from bacpypes.object import get_datatype, PropertyIdentifier
-from bacpypes.local import BIPLocalAddress  # Import the local address class
+from bacpypes3.primitivedata import Unsigned
+from bacpypes3.app import BIPSimpleApplication
+from bacpypes3.service.cov import ChangeOfValueServices
+from bacpypes3.errors import DecodingError, CommunicationError, ExecutionError, BACnetError, TimeoutError
+from bacpypes3.constructeddata import ArrayOf
+from bacpypes3.core import deferred, run
+from bacpypes3.iocb import IOCB
+from bacpypes3.local.device import LocalDeviceObject
+from bacpypes3.pdu import Address
 
 # Logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Global lock for thread safety
 subscription_lock = threading.Lock()
-logger = logging.getLogger(__name__)
 
 class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
     """
-    This class represents a BACnet application that handles device discovery, 
-    COV subscriptions, and property read/write operations.
+    BACnet application for device discovery, COV subscriptions, and property operations.
     """
     def __init__(self, device_name, device_id, local_address, bbmd_address=None):
-        # Create a local device object
-        self.this_device = LocalDeviceObject(
+        device = LocalDeviceObject(
             objectName=device_name,
-            objectIdentifier=('device', device_id)
+            objectIdentifier=('device', device_id),
+            maxApduLengthAccepted=1024,
+            segmentationSupported='segmentedBoth',
+            vendorIdentifier=15,
         )
 
-        # Initialize BACnet application
-        BIPSimpleApplication.__init__(self, self.this_device, local_address, bbmd_address)
+        BIPSimpleApplication.__init__(self, device, Address(local_address))
         ChangeOfValueServices.__init__(self)
 
         self.object_values = {}
@@ -61,13 +57,11 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
         self.discoveredDevices = []
         self._value_check_timer = None
 
-        self.logger = logging.getLogger(__name__)
-
     def do_WhoIsRequest(self, apdu):
         """Respond to Who-Is requests to support BBMD and device discovery."""
         self.logger.info(f"Received Who-Is Request from {apdu.pduSource}")
 
-        if self.local_address is None:  # Only respond if we are not a BBMD
+        if self.localAddress is None:  # Only respond if we are not a BBMD
             self.logger.info(f"Sending I-Am Request for device: {self.this_device.objectName[0].value}")
             self.response(IAmRequest())
 
@@ -86,54 +80,48 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
         lifetime = apdu.lifetime
 
         if obj_id is not None:
-            lifetime_seconds = lifetime.intValueSeconds() if lifetime else None  # Get lifetime in seconds
-
-            subscription = {"confirmed": confirmed, 
-                            "lifetime": lifetime_seconds, 
-                            "source": apdu.pduSource, 
-                            "timer": None, 
-                            "subscriberProcessIdentifier": apdu.subscriberProcessIdentifier,
-                            "property_id": apdu.monitoredPropertyIdentifier,
-                            "threshold": apdu.covIncrement.value if apdu.covIncrement else None
-                            }
-
-            with subscription_lock: # Lock the subscription dictionary
+            lifetime_seconds = lifetime.intValueSeconds() if lifetime else None  
+            subscription = {
+                "confirmed": confirmed, 
+                "lifetime": lifetime_seconds, 
+                "source": apdu.pduSource, 
+                "timer": None, 
+                "subscriberProcessIdentifier": apdu.subscriberProcessIdentifier,
+                "property_id": apdu.monitoredPropertyIdentifier,
+                "threshold": apdu.covIncrement.value if apdu.covIncrement else None
+            }
+            with subscription_lock:
                 self.cov_subscriptions.setdefault(obj_id, []).append(subscription)
 
             try:
-                self.send_ack(SimpleAckPDU(context=apdu))  # Acknowledge the subscription
+                self.send_ack(SimpleAckPDU(context=apdu)) 
             except (CommunicationError, BACnetError) as e:
                 self.logger.error(f"Error acknowledging SubscribeCOVRequest: {e}")
-                return  # Return to avoid scheduling renewal or value checking
+                return 
 
-            # Schedule the subscription for renewal if a lifetime is specified
             if lifetime_seconds is not None:
                 self.schedule_subscription_renewal(obj_id, lifetime_seconds, apdu.subscriberProcessIdentifier)
 
-            # Start the process to track object values (if not already running)
             if self._value_check_timer is None or not self._value_check_timer.is_alive():
                 self._value_check_timer = threading.Timer(5, self.check_object_values)
                 self._value_check_timer.start()
         else:
             self.send_error(Error(errorClass='object', errorCode='unknownObject', context=apdu))
-    
     def schedule_subscription_renewal(self, obj_id, lifetime_seconds, subscriberProcessIdentifier):
         """Schedule renewal of a COV subscription."""
         timer = threading.Timer(lifetime_seconds, self._renew_subscription, args=[obj_id, subscriberProcessIdentifier])
-        # Update the subscription with the timer and subscriberProcessIdentifier
-        with subscription_lock:  # Lock the subscription dictionary for thread safety
+        with subscription_lock:
             for i, sub in enumerate(self.cov_subscriptions[obj_id]):
-                if sub['subscriberProcessIdentifier'] == subscriberProcessIdentifier:  # Use subscriberProcessIdentifier for identification
+                if sub['subscriberProcessIdentifier'] == subscriberProcessIdentifier: 
                     self.cov_subscriptions[obj_id][i]["timer"] = timer
                     break
-
         timer.start()
         logger.info(f"Scheduled COV subscription renewal for {obj_id} in {lifetime_seconds} seconds")
 
     def _renew_subscription(self, obj_id, subscriberProcessIdentifier):
         """Renew a COV subscription."""
         self.logger.info(f"Renewing subscription for object: {obj_id}")
-        with subscription_lock:  # Lock the subscription dictionary for thread safety
+        with subscription_lock:
             subscriptions = self.cov_subscriptions.get(obj_id)
             if subscriptions:
                 for i, subscription in enumerate(subscriptions):
@@ -141,14 +129,12 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
                         confirmed_notifications = subscription['confirmed']
                         lifetime_seconds = subscription['lifetime']
                         pduSource = subscription['source']
-                        # Attempt to renew the subscription
                         try:
                             self.schedule_subscription_renewal(obj_id, lifetime_seconds, subscriberProcessIdentifier)
                         except Exception as e:
                             self.logger.error(f"Error scheduling renewal for object {obj_id}: {e}")
-                            continue  # Continue to try renewing other subscriptions
+                            continue
 
-                        # Send a notification upon renewal (if confirmed notifications are requested)
                         if confirmed_notifications:
                             try:
                                 self.send_cov_notification(
@@ -157,10 +143,9 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
                                     subscriberProcessId=subscriberProcessIdentifier,
                                     destination=pduSource
                                 )
-                            except Exception as e:  # Add error handling for notification sending
+                            except Exception as e:
                                 self.logger.error(f"Error sending COV notification for {obj_id}: {e}")
-
-                        break  # Only renew the matching subscription
+                        break 
             else:
                 self.logger.warning(f"Subscription for object {obj_id} not found. Renewal failed.")
 
@@ -177,32 +162,30 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
             else:
                 self.logger.warning(f"No subscription found for object {obj_id} with subscriber process ID {subscriber_process_id}")
 
-            if obj_id not in self.cov_subscriptions or not self.cov_subscriptions[obj_id]:  # If no more subscriptions
+            if obj_id not in self.cov_subscriptions or not self.cov_subscriptions[obj_id]:
                 if hasattr(self, '_value_check_timer') and self._value_check_timer.is_alive():
                     self._value_check_timer.cancel()
                     del self._value_check_timer
                     self.logger.info(f"Stopped checking object values for {obj_id} as there are no more subscriptions")
 
-        self.send_ack(SimpleAckPDU(context=apdu))  # Acknowledge the unsubscription
-
+        self.send_ack(SimpleAckPDU(context=apdu)) 
+        
     def check_object_values(self):
         """Periodically check object values for changes and send notifications."""
-        if self._value_check_timer:  # Only reschedule if the timer exists
-            threading.Timer(5, self.check_object_values).start()  # Reschedule the check
+        if self._value_check_timer: 
+            threading.Timer(5, self.check_object_values).start() 
 
-        with subscription_lock:  # Lock the subscriptions dictionary before accessing it
+        with subscription_lock: 
             for obj_id, subscriptions in self.cov_subscriptions.items():
                 for subscription in subscriptions:
                     try:
                         property_id = subscription.get('property_id')
                         # Read the property and validate the result
                         result = self.read_property(obj_id, property_id)
-
                         if result is not None:
                             # If it's a sequence, get the first value
-                            if isinstance(result, bacpypes.constructeddata.Sequence):
+                            if isinstance(result, bacpypes3.constructeddata.Sequence):
                                 result = result[0]
-
                             # Compare the new value with the stored value
                             if obj_id not in self.object_values or abs(result - self.object_values.get(obj_id)) >= subscription.get('threshold', 0.01):
                                 self.object_values[obj_id] = result
@@ -212,14 +195,13 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
                                     # Send the COV notification
                                     self.send_cov_notification(
                                         obj_id,
-                                        result,  # Use the read result directly
+                                        result,
                                         subscriberProcessId=subscriberProcessId,
                                         destination=pduSource
                                     )
-                    else:
-                        self.logger.warning(f"Error reading property {property_id} of object {obj_id}")
-                except (CommunicationError, BACnetError) as e:
-                    self.logger.error(f"Error checking or sending notification for {obj_id}/{property_id}: {e}")
+                    except (CommunicationError, BACnetError) as e:
+                        self.logger.error(f"Error checking or sending notification for {obj_id}/{property_id}: {e}")
+
 
     def send_cov_notification(self, obj_id, value, subscriberProcessId, destination):
         """Send a confirmed COV notification."""
@@ -228,17 +210,20 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
                 subscriberProcessIdentifier=subscriberProcessId,
                 initiatingDeviceIdentifier=self.this_device.objectIdentifier,
                 monitoredObjectIdentifier=obj_id,
-                timeRemaining=Unsigned(60)  # Assuming 1 minute lifetime for the notification
+                timeRemaining=Unsigned(60)  
             )
-            # Add the property value to the APDU
-            datatype = get_datatype(obj_id.objectType, "presentValue")
-            apdu.listOfValues = ArrayOf(datatype)
-            apdu.listOfValues.append(bacpypes.primitivedata.encode_application_data(value))
-
+            datatype = get_datatype(obj_id[0], "presentValue")  
+            apdu.listOfValues = ArrayOf(PropertyValue) 
+            apdu.listOfValues.append(
+                PropertyValue(
+                    propertyIdentifier=("presentValue",),
+                    value=ArrayOf(datatype)([value])
+                )
+            )
             # Send the APDU
             self.logger.info(f"Sending ConfirmedCOVNotificationRequest to {destination} for {obj_id}")
             self.request(apdu, destination)
-        except Exception as e:  # Add error handling for notification sending
+        except Exception as e:  
             self.logger.error(f"Error sending COV notification for {obj_id}: {e}")
 
     def do_ReadPropertyRequest(self, apdu):
@@ -248,8 +233,8 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
             prop_id = apdu.propertyIdentifier
             # Check if reading multiple properties
             if (
-                isinstance(prop_id, bacpypes.constructeddata.SequenceOf) and
-                prop_id[0].propertyIdentifier == bacpypes.object.PropertyIdentifier.all
+                isinstance(prop_id, bacpypes3.constructeddata.SequenceOf) and
+                prop_id[0].propertyIdentifier == bacpypes3.object.PropertyIdentifier.all
             ):
                 self.read_multiple_properties(apdu)  # Handle multiple property reads
                 return
@@ -262,7 +247,7 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
                 ack.propertyValue = result.propertyValue
                 self.response(ack)
             else:
-                raise ExecutionError(errorClass='property', errorCode='unknownProperty')  # Improved error code
+                raise ExecutionError(errorClass='property', errorCode='unknownProperty') 
         except (ValueError, DecodingError, CommunicationError, BACnetError) as e:
             self.logger.error(f"Error in ReadPropertyRequest: {e}")
             # More specific error handling based on exception type
@@ -273,27 +258,24 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
             else:
                 error_code = 'other' 
             self.response(Error(errorClass='property', errorCode=error_code, context=apdu))
-
-
     def read_multiple_properties(self, apdu):
         """Handles ReadPropertyMultiple requests."""
         try:
             obj_id = apdu.objectIdentifier
-
             # Assuming that the request is for "all" properties
             if (
-                isinstance(apdu.propertyIdentifierList, bacpypes.constructeddata.SequenceOf) and
-                apdu.propertyIdentifierList[0].propertyIdentifier == bacpypes.object.PropertyIdentifier.all
+                isinstance(apdu.propertyIdentifierList, bacpypes3.constructeddata.SequenceOf) and
+                apdu.propertyIdentifierList[0].propertyIdentifier == bacpypes3.object.PropertyIdentifier.all
             ):
                 # Get the class of the object and then get all of its properties
                 obj = self.get_object_by_id(obj_id)
                 if obj is not None:
-                    props = [(bacpypes.object.PropertyIdentifier(prop), obj.properties[prop].ReadProperty(obj, obj.properties[prop])) for prop in obj.properties]
+                    props = [(bacpypes3.object.PropertyIdentifier(prop), obj.properties[prop].ReadProperty(obj, obj.properties[prop])) for prop in obj.properties]
                 else:
                     raise BACnetError(f"Unknown object {obj_id}")
             else:
                 # If not "all" properties then only read the requested properties.
-                props = [(bacpypes.object.PropertyIdentifier(prop), None) for prop in apdu.propertyIdentifierList]
+                props = [(bacpypes3.object.PropertyIdentifier(prop), None) for prop in apdu.propertyIdentifierList]
         except (BACnetError, ValueError) as e:
             self.logger.error(f"Error in ReadPropertyMultiple: {e}")
             self.response(Error(errorClass='property', errorCode='unknownProperty', context=apdu))
@@ -312,8 +294,6 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
         except Exception as e:
             self.logger.error(f"Exception during readMultiple operation: {e}")
             self.response(Error(errorClass='services', errorCode='inconsistentSelection', context=apdu))
-
-
 
     def do_WritePropertyRequest(self, apdu):
         """Handle WriteProperty requests."""
@@ -338,11 +318,10 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
                 error_code = 'other' 
             self.response(Error(errorClass='property', errorCode=error_code, context=apdu))
 
-
 class BACnetClient:
     def __init__(self, bbmd_address, device_name='Custom-Client', device_id=1234):
         self.bbmd_address = bbmd_address
-        self.app = CustomCOVApplication(device_name, device_id, bacpypes.local.BIPLocalAddress(), bbmd_address)
+        self.app = CustomCOVApplication(device_name, device_id, bacpypes3.local.BIPLocalAddress(), bbmd_address)
         self.logger = logging.getLogger(__name__)
         self.devices = []
 
@@ -353,7 +332,7 @@ class BACnetClient:
         self.app.request(who_is)
         # Add a small delay to allow for responses
         deferred(self._get_discovered_devices, 1.0)
-        return self.devices  # Return the populated list of devices
+        return self.devices
 
     def _get_discovered_devices(self):
         """Store Discovered devices in a list"""
@@ -392,13 +371,13 @@ class BACnetClient:
     def write_property(self, obj_id, prop_id, value):
         """Writes a property to a BACnet object."""
         try:
-            obj = self.get_object_by_id(obj_id)
+            obj = self.app.get_object_by_id(obj_id)
             if obj is not None:
                 datatype = get_datatype(obj.objectType, prop_id)
                 if not datatype:
                     raise ValueError("invalid property for object")
 
-                value = bacpypes.primitivedata.encode_application_data(value, datatype)
+                value = bacpypes3.primitivedata.encode_application_data(value, datatype)
 
                 # build a request
                 request = WritePropertyRequest(
@@ -446,20 +425,42 @@ class BACnetClient:
                     issueConfirmedNotifications=confirmed_notifications,
                     subscriberProcessIdentifier=0,
                     lifetime=Unsigned(lifetime) if lifetime else None,
-                    covIncrement=bacpypes.primitivedata.Real(threshold) if threshold else None
+                    covIncrement=bacpypes3.primitivedata.Real(threshold) if threshold else None
                 )
             )
             if callback:
-                subscriptions.setdefault(object_identifier, []).append({
+                self.app.cov_subscriptions.setdefault(object_identifier, []).append({
                     "property_id": property_id,
                     "callback": callback,
                     "subscriberProcessIdentifier": 0,
-                    "threshold": threshold  # Store the threshold
+                    "threshold": threshold 
                 })
                 logging.info(f"Subscribed to changes for object: {object_identifier}, property: {property_id}")
         except (CommunicationError, BACnetError) as e:
             logger.error(f"Error subscribing to changes: {e}")
             return None
+
+    def get_available_object_properties(self, object_identifier):
+        """
+        Retrieve available properties for a BACnet object.
+        """
+        rp_req = ReadPropertyRequest(
+            objectIdentifier=object_identifier,
+            propertyIdentifier=PropertyIdentifier.propertyList
+        )
+        try:
+            iocb = IOCB(rp_req)
+            self.app.request_io(iocb)
+            iocb.wait()
+            response = iocb.ioResponse
+            if isinstance(response, ReadPropertyACK):
+                property_list = response.propertyValue
+                return [p.propertyIdentifier for p in property_list]
+            else:
+                self.logger.error(f"Failed to read propertyList from {object_identifier}")
+        except (CommunicationError, BACnetError, TimeoutError, AttributeError) as e:
+            self.logger.error(f"Error getting available object properties: {e}")
+        return []  # Return an empty list if properties couldn't be fetched
 
     def check_property_writable(self, object_identifier, property_identifier):
         """Check if the property is writable"""
@@ -472,7 +473,7 @@ class BACnetClient:
             self.app.request_io(iocb)
             iocb.wait()
             response = iocb.ioResponse
-            property_list = [bacpypes.object.PropertyIdentifier(prop_id) for prop_id in response.propertyList]
+            property_list = [bacpypes3.object.PropertyIdentifier(prop_id) for prop_id in response.propertyList]
             if property_identifier not in property_list:
                 raise BACnetError(f"propertyIdentifier {property_identifier} not in object {object_identifier}")
             object = self.app.get_object_by_id(object_identifier)
@@ -484,7 +485,6 @@ class BACnetClient:
             logging.error(f"Error checking property writable: {e}")
             return False
 
-
 def main():
     # Replace with the actual BBMD address and port
     bbmd_address = ("your_bbmd_ip_address", 47808)
@@ -495,10 +495,9 @@ def main():
     # --- Test Cases ---
 
     # 1. BBMD and Device Discovery Test:
-    client.app.discover_remote_devices()
-    # Add a delay to wait for responses before proceeding
-    time.sleep(2)
-
+    client.app.who_is() 
+    time.sleep(2) 
+    
     if client.app.discoveredDevices:
         logging.info("BBMD and Device Discovery Test: PASS")
 
@@ -512,8 +511,10 @@ def main():
         properties_to_read = [
             (PropertyIdentifier.objectName, "Object Name"),
             (PropertyIdentifier.description, "Description"),
-            (PropertyIdentifier.presentValue, "Present Value"),  # Assuming the device has these properties
-            # Add more properties as needed
+            (PropertyIdentifier.presentValue, "Present Value"),
+            (PropertyIdentifier.units, "Units"),
+            (PropertyIdentifier.objectType, "Object Type"),
+            # ... add more properties as needed
         ]
 
         for prop_id, prop_name in properties_to_read:
@@ -523,23 +524,24 @@ def main():
                     logging.info(f"Property Reading Test ({prop_name}): PASS - Value: {property_value}")
                 else:
                     logging.warning(f"Property Reading Test ({prop_name}): WARNING - Could not read property from {object_identifier}")
-            except Exception as e:  # Catch specific errors if needed
+            except Exception as e: 
                 logging.error(f"Property Reading Test ({prop_name}): FAIL - {e}")
-        # 3. Property Writing Test (optional, uncomment if applicable)
-        # Ensure you have write access to the properties you are trying to modify
-        # Replace PropertyIdentifier.description with the actual property you want to write to
-        writable_property = PropertyIdentifier.description  # Or another writable property
+            
+        # 3. Property Writability Check and Writing Test:
+        writable_property = PropertyIdentifier.description  
         new_description = "Updated description from BACnet Client"
-        if client.write_property(object_identifier, writable_property, new_description):
-            # Verify that the write was successful by reading the property back
-            updated_description = client.read_property(object_identifier, writable_property)
-            if updated_description == new_description:
-                logging.info(f"Property Writing Test: PASS - Wrote new description to object {object_identifier}")
+        if client.check_property_writable(object_identifier, writable_property):
+            if client.write_property(object_identifier, writable_property, new_description):
+                updated_description = client.read_property(object_identifier, writable_property)
+                if updated_description == new_description:
+                    logging.info(f"Property Writing Test: PASS - Wrote new description to object {object_identifier}")
+                else:
+                    logging.error(f"Property Writing Test: FAIL - Written value does not match for object {object_identifier}")
             else:
-                logging.error(f"Property Writing Test: FAIL - Written value does not match for object {object_identifier}")
+                logging.error(f"Property Writing Test: FAIL - Could not write to property {writable_property} on object {object_identifier}")
         else:
-            logging.error(f"Property Writing Test: FAIL - Could not write to property {writable_property} on object {object_identifier}")
-        
+            logging.info(f"Property Writing Test: SKIPPED - Property {writable_property} is not writable on object {object_identifier}")
+
         # 4. COV Subscription Tests
         cov_subscriptions = []
 
@@ -547,7 +549,7 @@ def main():
         def cov_confirmed_callback(obj_id, prop_id, value):
             logging.info(f"Confirmed COV Notification: Object {obj_id}, Property {prop_id}, Value: {value}")
 
-        # Ensure that `properties_to_subscribe` are actually present on the device before attempting to subscribe.
+        # Ensure you have a list of valid object properties
         properties_to_subscribe = client.get_available_object_properties(object_identifier)
 
         # Now subscribe to available properties
@@ -573,11 +575,5 @@ def main():
     else:
         logging.error("BBMD and Device Discovery Test: FAIL - No devices or BBMDs found.")
 
-
-# Callback function for COV notifications
-def cov_callback(obj_id, prop_id, value):
-    logging.info(f"COV Notification: Object {obj_id}, Property {prop_id}, Value: {value}")
-
 if __name__ == "__main__":
     main()
-
