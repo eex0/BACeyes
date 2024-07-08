@@ -31,6 +31,7 @@ from bacpypes.core import deferred, run
 from bacpypes.iocb import IOCB
 from bacpypes.local.device import LocalDeviceObject
 from bacpypes.object import get_datatype, PropertyIdentifier
+from bacpypes.local import BIPLocalAddress  # Import the local address class
 
 # Logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -368,34 +369,24 @@ class BACnetClient:
             }
             self.devices.append(device_dict)
 
-    def read_property(self, obj_id, prop_id):
+    def read_property(self, object_identifier, property_id):
         """Reads a property from a BACnet object."""
         try:
-            # Create a ReadPropertyRequest object
-            request = ReadPropertyRequest(
-                objectIdentifier=obj_id,
-                propertyIdentifier=prop_id,
+            iocb = self.app.read(
+                f'{object_identifier}/{property_id}'
             )
-            # Add error handling for timeout
-            iocb = IOCB(request)
-            iocb.set_timeout(10) # 10 seconds
-            self.request_io(iocb)
-            iocb.wait()  
-
             if iocb.ioResponse:
                 apdu = iocb.ioResponse
-
-                # Check if the response is a ReadPropertyACK
-                if isinstance(apdu, ReadPropertyACK):
-                    return apdu.propertyValue[0].value[0]
-                else:
-                    self.logger.error(f"Unexpected response type: {type(apdu)}")
+                if not isinstance(apdu, ReadPropertyACK):
+                    raise ValueError(f"ReadProperty did not succeed, got: {apdu}")
+                # Here you extract the value from the APDU
+                return apdu.propertyValue[0].value[0]
             else:
-                self.logger.error(f"ReadProperty request timed out for {obj_id}/{prop_id}")
-        except TimeoutError as e:
-            self.logger.error(f"TimeoutError during read property for {obj_id}/{prop_id}: {e}")
-        except Exception as e:
-            self.logger.error(f"Error reading property {obj_id}/{prop_id}: {e}")
+                # Check for other errors like Abort or Reject
+                if iocb.ioError:
+                    self.logger.error(f"Error reading property: {iocb.ioError}")
+        except (CommunicationError, BACnetError, TimeoutError) as e:
+            self.logger.error(f"Error reading property: {e}")
         return None  # Return None on error or timeout
 
     def write_property(self, obj_id, prop_id, value):
@@ -556,12 +547,13 @@ def main():
         def cov_confirmed_callback(obj_id, prop_id, value):
             logging.info(f"Confirmed COV Notification: Object {obj_id}, Property {prop_id}, Value: {value}")
 
-        # Create a list to hold your property IDs
-        properties_to_subscribe = [PropertyIdentifier.presentValue, PropertyIdentifier.objectName]
+        # Ensure that `properties_to_subscribe` are actually present on the device before attempting to subscribe.
+        properties_to_subscribe = client.get_available_object_properties(object_identifier)
 
+        # Now subscribe to available properties
         for prop in properties_to_subscribe:
             try:
-                cov_subscriptions.append(client.subscribe_to_changes(object_identifier, prop, cov_confirmed_callback, lifetime=60, threshold=0.5)) # subscribe for 60 seconds
+                cov_subscriptions.append(client.subscribe_to_changes(object_identifier, prop, cov_confirmed_callback, lifetime=60, threshold=0.5))
             except Exception as e:
                 logging.error(f"Error subscribing to property {prop}: {e}")
 
@@ -588,3 +580,4 @@ def cov_callback(obj_id, prop_id, value):
 
 if __name__ == "__main__":
     main()
+
