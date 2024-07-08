@@ -29,18 +29,15 @@ Classes and Their Roles
         It keeps track of subscribed properties and their current values to detect changes.
         It automatically renews subscriptions that have a limited lifetime.
 
-    BACnetClient:
-        This class provides a user-friendly interface to interact with the BACnet network.
-        Its main methods are:
-            discover_devices(): Initiates the device discovery process and returns information about found devices.
-            read_property(): Reads the value of a specific property on a device.
-            write_property(): Writes a new value to a property (if allowed).
-            subscribe_to_changes(): Subscribes to notifications for a property's value changes.
+        discover_devices(): Initiates the device discovery process and returns information about found devices.
+        read_property(): Reads the value of a specific property on a device.
+        write_property(): Writes a new value to a property (if allowed).
+        subscribe_to_changes(): Subscribes to notifications for a property's value changes.
 
 Main Function (How It Works)
 
     Initialization:
-        It sets up a BACnetClient instance connected to the specified BBMD address.
+        The software sets up a instance connected to the specified BBMD address.
         A device name and ID are assigned to the client.
     Discovery:
         app.discover_remote_devices() is called to initiate the Who-Is/I-Am discovery process, finding all BACnet devices (including BBMDs) on the network.
