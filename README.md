@@ -7,9 +7,16 @@ Work in progress!
 
 Here's a breakdown of the key functionalities:
 
-    Discovering BACnet Devices: The code can find and list BACnet devices on the network, providing information about each device (ID, name, address, etc.). This is essential for knowing what devices are available to interact with.
+    Discovering BACnet Devices: The code can find and list BACnet devices on the network, 
+    providing information about each device (ID, name, address, etc.). This is essential 
+    for knowing what devices are available to interact with.
 
-    Change of Value (COV) Subscription Management: It allows you to subscribe to notifications when specific properties (like temperature, status, etc.) on a BACnet device change.  This is a powerful mechanism for monitoring real-time data without constantly polling the devices.
+    Change of Value (COV) Subscription Management: It allows you to subscribe to 
+    notifications when specific properties (like temperature, status, etc.) on a BACnet 
+    device change.  
+    
+    This is a powerful mechanism for monitoring real-time data without constantly polling 
+    the devices.
 
 Classes and Their Roles
 
