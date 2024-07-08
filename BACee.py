@@ -31,7 +31,7 @@ from bacpypes3.apdu import (
     PropertyValue,
 )
 from bacpypes3.primitivedata import Real, Unsigned
-from bacpypes3.errors import DecodingError, ExecutionError
+from bacpypes3.errors import DecodingError, ExecutionError, CommunicationError, TimeoutError
 
 # Create a logger
 logging.basicConfig(level=logging.DEBUG)
@@ -121,23 +121,6 @@ class COVClient(BIPSimpleApplication):
         except Exception as e:
             _logger.error(f"Failed to subscribe to COV notifications: {e}")
 
-
-    async def iter_objects(self, device_id):
-        """Iterate over all objects in a device."""
-        request = ReadPropertyRequest(
-            objectIdentifier=('device', device_id),
-            propertyIdentifier='objectList',
-        )
-        iocb = IOCB(request)
-        iocb.set_destination(Address(device_id))
-        await self.request_io(iocb)
-
-        if iocb.ioResponse:
-            object_list = iocb.ioResponse.propertyValue[0]
-            for obj_id in object_list:
-                yield obj_id
-        else:
-            _logger.error(f"Failed to read objectList for device {device_id}")
 
     def start_subscription_renewal_task(self, obj_id, property_identifier, lifetime_seconds, device_id):
         async def renew_subscription():
@@ -302,10 +285,10 @@ class COVClient(BIPSimpleApplication):
             for property_value in apdu.listOfValues:
                 obj_id = apdu.monitoredObjectIdentifier
                 prop_id = property_value.propertyIdentifier
-                value = property_value.value[0]
+                value = property_value.value.tagValue
                 _logger.info(f"Object {obj_id}, Property: {prop_id}, Value: {value}")
 
-                self.obj_value[obj_id] = {prop_id[0]:value}  # Create new value dict
+                self.obj_value.setdefault(obj_id, {})[prop_id] = value
         except Exception as e:
             _logger.error(f"Error processing COV notification: {e}")
     
@@ -313,26 +296,28 @@ class COVClient(BIPSimpleApplication):
         """Override handle_apdu to handle different APDU types."""
         _logger.debug(f"APDU received: {apdu}")
         if isinstance(apdu, ConfirmedCOVNotificationRequest):
-            await self.on_cov_notification(apdu)
+           await self.on_cov_notification(apdu)
             
-    def do_ConfirmedCOVNotificationRequest(self, apdu: ConfirmedCOVNotificationRequest) -> None:
-        """Handle COV notifications."""
+    async def do_ConfirmedCOVNotificationRequest(self, apdu: ConfirmedCOVNotificationRequest) -> None:
+        """Handle COV notifications more robustly."""
         _logger.info(f"Received COV notification: {apdu}")
-        # Get the value from the notification
-        for element in apdu.listOfValues:
-            prop_id = element.propertyIdentifier
-            value = element.value[0]
 
-            # Extract the object identifier
-            obj_id = apdu.monitoredObjectIdentifier
+        try:
+            for element in apdu.listOfValues:
+                prop_id = element.propertyIdentifier
+                value = element.value.cast_out(get_datatype(apdu.monitoredObjectIdentifier[0], prop_id))
 
-            # Update the stored value for this object
-            self.obj_value[obj_id] = {prop_id[0]: value}  # Create new value dict
+                obj_id = apdu.monitoredObjectIdentifier
 
-            _logger.info(f"COV notification - Object: {obj_id}, Property: {prop_id[0]}, Value: {value}")
+                self.obj_value.setdefault(obj_id, {})[prop_id] = value
+                await self.monitor_cov(obj_id, prop_id, value)  # Use monitor_cov here
 
-        # Send an acknowledgement
-        self.response(SimpleAckPDU(context=apdu))
+                _logger.info(f"COV notification - Object: {obj_id}, Property: {prop_id}, Value: {value}")
+        except Exception as e:
+            _logger.error(f"Error processing COV notification: {e}")
+        finally:
+            # Always send an ACK even if there was an error
+            self.response(SimpleAckPDU(context=apdu))
 
 
 async def main():
