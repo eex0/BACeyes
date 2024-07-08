@@ -312,6 +312,8 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
             self.logger.error(f"Exception during readMultiple operation: {e}")
             self.response(Error(errorClass='services', errorCode='inconsistentSelection', context=apdu))
 
+
+
     def do_WritePropertyRequest(self, apdu):
         """Handle WriteProperty requests."""
         try:
