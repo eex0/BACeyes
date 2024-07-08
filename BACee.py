@@ -334,35 +334,6 @@ class CustomCOVApplication(ChangeOfValueServices, BIPSimpleApplication):
             else:
                 error_code = 'other' 
             self.response(Error(errorClass='property', errorCode=error_code, context=apdu))
-        
-    def read(self, identifier):
-        """Placeholder method to simulate reading a property."""
-        try:
-            obj_id, prop_id = identifier.split('/')
-            if validate_object_id(obj_id) and prop_id in PropertyIdentifier.vendor_range:
-                self.logger.info(f"Reading property {prop_id} of object {obj_id}")
-                return ReadPropertyACK(objectIdentifier=obj_id, propertyIdentifier=prop_id, propertyValue=ArrayOf(Unsigned)(1))
-            else:
-                self.logger.error("Invalid object ID or property identifier")
-                return None
-        except Exception as e:
-            self.logger.error(f"Exception during read operation: {e}")
-            return None
-
-    def write(self, identifier, value):
-        """Placeholder method to simulate writing a property."""
-        try:
-            obj_id, prop_id = identifier.split('/')
-            if validate_object_id(obj_id) and prop_id in PropertyIdentifier.vendor_range:
-                self.logger.info(f"Writing value to property {prop_id} of object {obj_id}")
-                # Simulate successful write
-                return True
-            else:
-                self.logger.error("Invalid object ID or property identifier")
-                return False
-        except Exception as e:
-            self.logger.error(f"Exception during write operation: {e}")
-            return False
 
 
 class BACnetClient:
@@ -395,37 +366,83 @@ class BACnetClient:
             }
             self.devices.append(device_dict)
 
-    def read_property(self, object_identifier, property_id):
+    def read_property(self, obj_id, prop_id):
         """Reads a property from a BACnet object."""
         try:
-            iocb = self.app.read(
-                f'{object_identifier}/{property_id}'
+            # Create a ReadPropertyRequest object
+            request = ReadPropertyRequest(
+                objectIdentifier=obj_id,
+                propertyIdentifier=prop_id,
             )
+            # Add error handling for timeout
+            iocb = IOCB(request)
+            iocb.set_timeout(10) # 10 seconds
+            self.request_io(iocb)
+            iocb.wait()  
+
             if iocb.ioResponse:
                 apdu = iocb.ioResponse
-                if not isinstance(apdu, ReadPropertyACK):
-                    raise ValueError(f"ReadProperty did not succeed, got: {apdu}")
-                # Here you extract the value from the APDU
-                return apdu.propertyValue[0].value[0]
-        except (CommunicationError, BACnetError) as e:
-            self.logger.error(f"Error reading property: {e}")
-            return None # Return None on error
 
-    def write_property(self, object_identifier, property_id, value):
+                # Check if the response is a ReadPropertyACK
+                if isinstance(apdu, ReadPropertyACK):
+                    return apdu.propertyValue[0].value[0]
+                else:
+                    self.logger.error(f"Unexpected response type: {type(apdu)}")
+            else:
+                self.logger.error(f"ReadProperty request timed out for {obj_id}/{prop_id}")
+        except TimeoutError as e:
+            self.logger.error(f"TimeoutError during read property for {obj_id}/{prop_id}: {e}")
+        except Exception as e:
+            self.logger.error(f"Error reading property {obj_id}/{prop_id}: {e}")
+        return None  # Return None on error or timeout
+
+    def write_property(self, obj_id, prop_id, value):
         """Writes a property to a BACnet object."""
         try:
-            iocb = self.app.write(
-                f'{object_identifier}/{property_id}:{value}'
-            )
-            # check for success
-            if iocb.ioError:
-                self.logger.error(f"Error writing property: {iocb.ioError}")
-                return False  # Indicate write failure
+            obj = self.get_object_by_id(obj_id)
+            if obj is not None:
+                datatype = get_datatype(obj.objectType, prop_id)
+                if not datatype:
+                    raise ValueError("invalid property for object")
+
+                value = bacpypes.primitivedata.encode_application_data(value, datatype)
+
+                # build a request
+                request = WritePropertyRequest(
+                    objectIdentifier=obj_id,
+                    propertyIdentifier=prop_id
+                )
+                request.propertyValue = Any()
+                request.propertyValue.cast_in(value)
+
+                # optional parameters
+                request.priority = Unsigned(16)
+
+                # Add error handling for timeout
+                iocb = IOCB(request)
+                iocb.set_timeout(10) # 10 seconds
+                self.request_io(iocb)
+                iocb.wait()  
+
+                # do something for success
+                if iocb.ioResponse:
+                    apdu = iocb.ioResponse
+                    self.logger.info(f"WriteProperty: {apdu}")
+                    return True
+
+                # do something for error/reject/abort
+                if iocb.ioError:
+                    self.logger.error(f"WriteProperty: {iocb.ioError}")
+                    return False
             else:
-                return True  # Indicate write success
-        except (CommunicationError, BACnetError) as e:
-            self.logger.error(f"Error writing property: {e}")
-            return False  # Indicate write failure
+                self.logger.error("Object not found on local device.")
+                return False
+        except (ValueError, TypeError) as error:
+            self.logger.error(f"WriteProperty: {error}")
+            return False
+        except Exception as e:
+            self.logger.error(f"WriteProperty: {e}")
+            return False
 
     def subscribe_to_changes(self, object_identifier, property_id, callback=None, confirmed_notifications=True, lifetime=None, threshold=0.01):
         """Subscribe to COV notifications for the specified object and property."""
