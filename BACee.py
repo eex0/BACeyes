@@ -10,662 +10,337 @@
 import bacpypes
 import json
 import logging
-import socket
 import threading
 import time
 
-from bacpypes.object import validateObjectId
-from bacpypes.errors import CommunicationError, BACnetError
-from threading import Lock
+from bacpypes.object import validate_object_id
+from bacpypes.pdu import PDU
+from bacpypes.apdu import (
+    WhoIsRequest, IAmRequest, SubscribeCOVRequest,
+    ConfirmedCOVNotificationRequest, SimpleAckPDU,
+    ReadPropertyRequest, WritePropertyRequest, ReadPropertyACK,
+    Error, RejectPDU, AbortPDU
+)
+from bacpypes.primitivedata import Unsigned
+from bacpypes.app import BIPSimpleApplication
+from bacpypes.service.cov import ChangeOfValueServices
+from bacpypes.errors import DecodingError, CommunicationError
+from bacpypes.constructeddata import ArrayOf
+from bacpypes.core import deferred, run
+from bacpypes.iocb import IOCB
+from bacpypes.local.device import LocalDeviceObject
+from bacpypes.object import get_object_class, get_datatype, PropertyIdentifier
 
-class BBMDManager(BACnetManager):
-    def __init__(self):
-        super().__init__()
-        self.bdt_table = None
-        self.discover_bbmds()
+# Logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-    def discover_bbmds(self):
-        self.bdt_table = {}
-        who_is_message = self.create_who_is_message()
-        for network in range(1, 256):
-            for port in [47808]:  # Corrected port number for BACnet
-                try:
-                    response = self.send_message(network, port, who_is_message)
-                    if response and self.is_iam_response(response):
-                        address = self.extract_bbmd_address(response)
-                        self.bdt_table[address] = {"network": network, "port": port}
-                except Exception as e:
-                    logging.error(f"Error discovering BBMD on network {network}, port {port}: {e}")
-        self.bdt_communicator = BBMDCommunicator(self.bdt_table)
-        return
+# Global dictionary for COV subscriptions
+subscriptions = {}
+logger = logging.getLogger(__name__)
 
-    def create_who_is_message(self):
-        message = Message()
-        pdu = PDU(
-            pdu_type=PDU.PDU_TYPE_CONFIRMED_REQUEST,
-            service_id=ServiceOption.SERVICE_CONFIRMED_WHO_IS,
+class CustomCOVApplication(BIPSimpleApplication, ChangeOfValueServices):
+    def __init__(self, device_name, device_id, local_address, bbmd_address=None):
+        # Create a local device object
+        self.this_device = LocalDeviceObject(
+            objectName=device_name,
+            objectIdentifier=('device', device_id)
         )
-        pdu.destination_object_type = BacnetObjectType.OBJECT_DEVICE
-        message.pdu = pdu
-        return message
 
-    def is_iam_response(self, response):
-        service_id = get_service_id(response)
-        return service_id == 0
+        # Initialize BACnet application
+        BIPSimpleApplication.__init__(self, self.this_device, local_address, bbmd_address)
+        ChangeOfValueServices.__init__(self)
 
-    def extract_bbmd_address(self, response_data):
-        try:
-            decoded_data = decode_asn1(response_data)
-            bbmd_address = decoded_data["WhoIs"]["BACnetAddress"]
-            return bbmd_address
-        except Exception as e:
-            logging.error(f"Error parsing BBMD address: {e}")
-            return None
+        self.object_values = {}
+        self.cov_subscriptions = {}
+        self.discoveredDevices = []
+        self._value_check_timer = None
 
-    def get_bdt_table(self):
-        if self.bdt_table:
-            return self.bdt_table.copy()
-        return None
+    def do_WhoIsRequest(self, apdu):
+        """Respond to Who-Is requests to support BBMD and device discovery."""
+        logger.info(f"Received Who-Is Request from {apdu.pduSource}")
 
-    def send_broadcast_message(self):
-        try:
-            self.bbmd_communicator.send_broadcast(message)
-        except CommunicationError as e:
-            logging.error(f"Error sending broadcast message: {message} - {e}")
-            raise
+        if self.local_address is None:  # Only respond if we are not a BBMD
+            logger.info(f"Sending I-Am Request for device: {self.this_device.objectName[0].value}")
+            self.response(IAmRequest())
 
-        
-class COVMonitor:
-    def __init__(self, object_reference, bacnet_manager):
-        self.object_reference = object_reference
-        self.bacnet_manager = bacnet_manager
-        self.monitored_properties = []
-        self.previous_values = {}
+    def do_IAmRequest(self, apdu):
+        """Process I-Am requests to track discovered devices."""
+        device_id = apdu.iAmDeviceIdentifier[1]  # Assuming device identifier is the second octet
+        device_address = apdu.pduSource
+        logger.info(f"Received I-Am Request from device {device_id} at {device_address}")
+        self.discoveredDevices.append(apdu)
 
-    def set_monitored_properties(self, properties):
-        self.monitored_properties = properties
-
-    def execute(self):
-        for prop_id in self.monitored_properties:
-            current_value = self.bacnet_manager.read_property(self.object_reference, prop_id)
-            previous_value = self.previous_values.get(prop_id)
-            if previous_value is None or abs(current_value - previous_value) > 0.01:
-                self.previous_values[prop_id] = current_value
-                self.notify_change(prop_id, current_value)
-                return True
-        return False
-
-    def notify_change(self, prop_id, value):
-        logging.info(f"Change detected: object {self.object_reference}, property {prop_id}, new value: {value}")
-
-    def get_notification_data(self, prop_id):
-        return self.previous_values.get(prop_id)
-
-
-def discover_devices(self) -> list[str]:
-    devices = []
-    try:
-        if BBMDManager:
-            bbmd_manager = BBMDManager()
-            try:
-                bdt_table = bbmd_manager.get_bdt_table()
-                if bdt_table:
-                    for address, _ in bdt_table.items():
-                        devices.append(address)
-            except Exception as e:  # Catch errors during BBMD communication
-                self.logger.warning(f"Error communicating with BBMD: {e}")
-    except ImportError:
-        self.logger.warning("BBMDManager not found. Device discovery")
-
-class COVManager:
-    def __init__(self, primary=True, backup_address=None):
-        self.primary = primary
-        self.backup_address = backup_address
-        self.subscriptions = {}
-        self.lock = threading.Lock()
-        self.heartbeat_timer = None
-        self.socket = None
-        self.failover_timer = None
-        self.backup_server_address = "..."  
-        self.renewal_lock = threading.Lock()  
-        
     def do_SubscribeCOVRequest(self, apdu):
-        obj_ref = apdu.decode_object_reference()
-        if obj_ref not in self.device.objects:
-            self.cov_reject(None, apdu, None)
-            return
+        """Handles SubscribeCOVRequests from clients."""
+        logger.info("Received SubscribeCOVRequest")
+        obj_id = apdu.monitoredObjectIdentifier
+        confirmed = apdu.issueConfirmedNotifications
+        lifetime = apdu.lifetime
 
-        cov_monitor = self._get_cov_monitor(obj_ref)
-        subscription = COVSubscription(obj_ref, client_addr, proc_id, obj_id, confirmed, lifetime)
-        subscription.cov_monitor = cov_monitor
-        self.add_subscription(subscription)
-        self.cov_ack(subscription, apdu, None)
-        if self.primary:
-            self.send_message({"type": "subscription", "data": subscription.to_dict()}, self.backup_address)
+        if obj_id is not None:
+            lifetime_seconds = lifetime.intValueSeconds() if lifetime else None  # Get lifetime in seconds
 
-    def add_subscription(self, subscription):
-        if subscription.object_ref not in self.subscriptions:
-            self.subscriptions[subscription.object_ref] = []
-        self.subscriptions[subscription.object_ref].append((subscription, subscription.cov_monitor))
+            subscription = (confirmed, lifetime_seconds, apdu.pduSource, None, apdu.subscriberProcessIdentifier)
+            self.cov_subscriptions[obj_id] = self.cov_subscriptions.get(obj_id, []) + [subscription]
 
-    def _validate_subscription(self, object_ref, prop_id, params):
-      # Implement logic to validate object, property, and subscription parameters
-      return True  # Replace with actual validation logic
+            self.send_ack(SimpleAckPDU(context=apdu))  # Acknowledge the subscription
 
-    def cancel_subscription(self, subscription):
-        subscriptions = self.subscriptions.get(subscription.object_ref)
-        if subscriptions:
-            for i, (cov_sub, _) in enumerate(subscriptions):
-                if cov_sub == subscription:
-                    del subscriptions[i]
-                    break
-            if not subscriptions:
-                del self.subscriptions[subscription.object_ref]
+            # Schedule the subscription for renewal if a lifetime is specified
+            if lifetime_seconds is not None:
+                self.schedule_subscription_renewal(obj_id, lifetime_seconds, apdu.subscriberProcessIdentifier)
 
-    def cov_notification(self, subscription, request):
-        pass
-
-    def handle_cov_notification(self, apdu):
-        if self.confirmed:
-            ack_pdu = SimpleAckPDU(context=apdu)
-            self.send_ack(ack_pdu)
-
-    def do_ConfirmedCOVNotificationRequest(self, apdu):
-        cov_monitor = self.find_cov_monitor(apdu.monitoredObjectIdentifier)
-        if cov_monitor:
-            cov_monitor.handle_confirmed_cov_notification(apdu)
+            # Start the process to track object values (if not already running)
+            if not hasattr(self, '_value_check_timer') or not self._value_check_timer.is_alive():
+                self._value_check_timer = threading.Timer(5, self.check_object_values)
+                self._value_check_timer.start()
         else:
-            self.handleError(f"COV monitor not found for object ID: {apdu.monitoredObjectIdentifier}")
-
-        try:
-            new_value = self._extract_value_from_apdu(apdu)
-        except Exception as e:
-            self.handleError(f"Error extracting value from COV notification: {e}")
-            return
-
-        if cov_monitor:
-            cov_monitor.handle_new_value(new_value)
-
-    def do_UnconfirmedCOVNotificationRequest(self, apdu):
-        cov_monitor = self.find_cov_monitor(apdu.monitoredObjectIdentifier)
-        if cov_monitor:
-            cov_monitor.handle_unconfirmed_cov_notification(apdu)
-
-    def cov_confirmation(self, iocb):
-        pass
-
-    def cov_ack(self, subscription, request, response):
-        pass
-
-    def send_ack(self, ack_pdu):
-        try:
-            self.bacnet_manager.send_pdu(ack_pdu)
-        except Exception as e:
-            self.handleError(f"Failed to send COV ack: {e}")
-
-    def handleError(self, message):
-        logging.error("COVManager Error: %s", message)
-
-    def cov_error(self, subscription, request, response):
-        """Handles errors received during COV communication."""
-        # Handle specific BACnet errors (e.g., BACnetRejectRequest, BACnetAbort)
-        if isinstance(response, BACnetRejectRequest):
-            self.handleError(f"COV subscription rejected: {response.reason}")
-        elif isinstance(response, BACnetAbort):
-            self.handleError(f"COV subscription aborted: {response.reason}")
-        # ... (handle other errors)
-
-    def _get_cov_monitor(self, object_reference):
-        if object_reference.object_type == BacnetObjectType.OBJECT_ANALOG_VALUE:
-            return AnalogValueCOVMonitor(object_reference, self.bacnet_manager)
-
-    def cov_reject(self, subscription, request, response):
-        pass
-
-    def cov_abort(self, subscription, request, response):
-        pass
-
-    def _extract_value_from_apdu(self, apdu):
-        obj_type = apdu.monitoredObjectIdentifier.object_type
-        prop_id = apdu.decode_property_id()
-
-        if obj_type == BacnetObjectType.OBJECT_ANALOG_VALUE:
-            if prop_id == PropertyIdentifier.PRESENT_VALUE:
-                return apdu.value.cast_to(float)
-        elif obj_type == BacnetObjectType.OBJECT_BINARY_OUTPUT:
-            if prop_id == PropertyIdentifier.PRESENT_VALUE:
-                return apdu.value.cast_to(bool)
-        elif obj_type == BacnetObjectType.OBJECT_MULTISTATE_OUTPUT:
-            if prop_id == PropertyIdentifier.PRESENT_VALUE:
-                return apdu.value.cast_to(int)
-                
-        # ... (handle other BACnetObjectType as needed)
-
-        else:
-            raise NotImplementedError(f"Value extraction for object type {obj_type} not implemented")
-
-    def _get_detection_algorithm(self, obj_ref):
-        if isinstance(self.device.objects[obj_ref], AnalogValueObject):
-            return AnalogValueCOVMonitor(obj_ref, self.bacnet_manager)
-        else:
-            return BasicCOVMonitor(obj_ref, self.bacnet_manager)
-
-    def start(self):
-        if self.primary:
-            self.start_heartbeat()
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        else:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.connect((self.backup_address, PORT))
-            self.listen_for_updates()
-
-    def start_heartbeat(self):
-        self.heartbeat_timer = threading.Timer(5, self.send_heartbeat)
-        self.heartbeat_timer.start()
-
-    def send_heartbeat(self):
-        retry_count = 0
-        max_retries = 3
-
-        while retry_count < max_retries:
-            try:
-                if self.primary and self.socket:
-                    self.send_message({"type": "heartbeat"}, self.backup_address)
-                    break
-            except Exception as e:
-                logging.error(f"Error sending heartbeat (attempt {retry_count+1}/{max_retries}): {e}")
-                if self.primary:
-                    try:
-                        self.socket.close()
-                    except OSError:
-                        logging.info("Socket already closed")
-                    self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                retry_count += 1
-                time.sleep(2)
-
-        if retry_count == max_retries:
-            logging.error("Failed to send heartbeat after retries.")
-
-        self.heartbeat_timer = threading.Timer(5, self.send_heartbeat)
-        self.heartbeat_timer.start()
-  
-    def listen_for_updates(self):
-        while True:
-            try:
-                with self.renewal_lock:
-                    data = self.socket.recv(1024)
-                    if data:
-                        logging.info("Received update data from primary server")
-            except Exception as e:
-                logging.error(f"Error receiving update data: {e}")
+            self.send_error(Error(errorClass='object', errorCode='unknownObject', context=apdu))
+    
+    def schedule_subscription_renewal(self, obj_id, lifetime_seconds, subscriberProcessIdentifier):
+        """Schedule renewal of a COV subscription."""
+        timer = threading.Timer(lifetime_seconds, self._renew_subscription, args=[obj_id, subscriberProcessIdentifier])
+        # Update the subscription with the timer and subscriberProcessIdentifier
+        for i, sub in enumerate(self.cov_subscriptions[obj_id]):
+            if sub[4] == subscriberProcessIdentifier:  # Use subscriberProcessIdentifier for identification
+                self.cov_subscriptions[obj_id][i] = (*sub[:3], timer, subscriberProcessIdentifier)
                 break
-        self.socket.close()
-
-    def send_message(self, message, address):
-        try:
-            self.socket.connect(address) if not self.primary else None
-            self.socket.sendall(json.dumps(message).encode())
-        except Exception as e:
-            print(f"Error sending message: {e}")
-        finally:
-            self.socket.close() if not self.primary else None
-
-    def process_update(self, update):
-        if update["type"] == "subscription":
-            self.handle_subscription(update["data"])
-        elif update["type"] == "property_change":
-            self.handle_property_change(update["data"])
-        elif update["type"] == "heartbeat":
-            self.reset_failover_timer()
-        else:
-            print(f"Unknown update type: {update['type']}")
-
-    def subscribe_to_changes(self, object_reference, property_id, callback, duration=None):
-      # Existing subscription logic (validation, COV monitor selection)
-      subscription = COVSubscription(object_reference, property_id, callback, duration)
-      self.subscriptions[object_reference] = (subscription, cov_monitor)
-      if duration is not None:
-        self.schedule_renewal(subscription)
-      return subscription
-
-    def schedule_renewal(self, subscription):
-      with self.renewal_lock:  # Acquire lock for thread safety
-        if subscription.duration is not None and not subscription.renewal_scheduled:
-          # Schedule renewal task using timer
-          timer = threading.Timer(subscription.duration, self._handle_renewal, args=[subscription])
-          timer.start()
-          subscription.renewal_scheduled = True
-
-    def handle_subscription(self, subscription_data):
-      object_ref = subscription_data.get("objectRef")
-      prop_id = subscription_data.get("propertyId")
-      params = subscription_data.get("params", {})  # Optional parameters
-
-      # Validate subscription and create/update COV monitor
-      if self._validate_subscription(object_ref, prop_id, params):
-        monitor = self._get_cov_monitor(object_ref)  # Get or create monitor
-        # ... (set monitor properties based on subscription data and params)
-        self.subscriptions[object_ref][prop_id] = (monitor, params)  # Store subscription
-
-    def handle_property_change(self, property_data):
-      object_ref = property_data.get("objectRef")
-      prop_id = property_data.get("propertyId")
-      new_value = property_data.get("value")
-
-      subscriptions = self.subscriptions.get(object_ref)
-      if subscriptions:
-        for _, monitor in subscriptions.values():
-          if monitor.monitored_properties and prop_id in monitor.monitored_properties:
-            monitor.handle_new_value(new_value)
-
-    def _handle_renewal(self, subscription):
-      with self.renewal_lock:  # Acquire lock for thread safety
-        if subscription in self.subscriptions:  # Check if subscription still exists
-          self.subscriptions[subscription.object_reference] = self.renew_subscription(subscription)
-
-    def renew_subscription(self, subscription):
-      # Re-subscribe logic (call subscribe_to_changes with existing parameters)
-      return self.subscribe_to_changes(subscription.object_reference, subscription.property_id, subscription.callback, subscription.duration)
-
-    def reset_failover_timer(self):
-      """Resets the timer for tracking backup server health."""
-      if self.failover_timer:
-         self.failover_timer.cancel()  # Cancel previous timer if running
-         self.failover_timer = Timer(self.failover_timeout, self._handle_failover)
-         self.failover_timer.start()
-        
-    def _handle_failover(self):
-      """Initiate failover procedures if backup server is unavailable."""
-      # Implement logic to transfer subscriptions or data to backup server
-      #  using the configured backup_server_address
-      print("Failover initiated! Transferring data to backup server...")
-
-
-class COVSubscription:
-    def __init__(self, object_reference, property_id, callback, duration=None):
-      self.object_reference = object_reference
-      self.property_id = property_id
-      self.callback = callback
-      self.duration = duration  # New field for subscription duration
-      self.renewal_scheduled = False  # Flag to track renewal scheduling
-
-    def to_dict(self):
-        return {
-            "object_ref": self.object_ref.to_dict(),
-            "client_addr": self.client_addr,
-            "proc_id": self.proc_id,
-            "obj_id": self.obj_id,
-            "confirmed": self.confirmed,
-            "lifetime": self.lifetime,
-        }
-
-    def cancel_subscription(self, cov_manager):
-      # Existing cancellation logic (remove from COVManager dictionary)
-      cov_manager.remove_subscription(self)
-
-    def renew_subscription(self, cov_manager):
-      if self.duration is not None and not self.renewal_scheduled:
-        # Schedule renewal task (can be implemented in different ways)
-        # Here's an example using a timer:
-        import threading
-        timer = threading.Timer(self.duration, self._handle_renewal, args=[cov_manager])
         timer.start()
-        self.renewal_scheduled = True
+        logger.info(f"Scheduled COV subscription renewal for {obj_id} in {lifetime_seconds} seconds")
 
-    def process_task(self):
-        self.cancel_subscription()
-
-    def _handle_renewal(self, cov_manager):
-      # Re-subscribe with COVManager
-      cov_manager.subscribe_to_changes(self.object_reference, self.property_id, self.callback, self.duration)
-      self.renewal_scheduled = False  # Reset renewal flag
-
-class COVDetectionAlgorithm:
-    def __init__(self, monitored_properties, reported_properties):
-        self.monitored_properties = monitored_properties
-        self.reported_properties = reported_properties
-
-    def execute(self):
-        pass
-
-    def send_cov_notifications(self):
-        subscriptions = self.cov_manager.subscriptions.get(self.object_ref)
+    def _renew_subscription(self, obj_id, subscriberProcessIdentifier):
+        """Renew a COV subscription."""
+        logger.info(f"Renewing subscription for object: {obj_id}")
+        subscriptions = self.cov_subscriptions.get(obj_id)
         if subscriptions:
-            for subscription, _ in subscriptions:
-                pass
+            for i, subscription in enumerate(subscriptions):
+                if subscription[4] == subscriberProcessIdentifier:
+                    confirmed_notifications, lifetime_seconds, pduSource, _, _ = subscription
+                    self.schedule_subscription_renewal(obj_id, lifetime_seconds, subscriberProcessIdentifier)
+                    # Send a notification upon renewal (if confirmed notifications are requested)
+                    if confirmed_notifications:
+                        self.send_cov_notification(
+                            obj_id,
+                            self.object_values[obj_id],
+                            subscriberProcessId=subscriberProcessIdentifier,
+                            destination=pduSource
+                        )  
+                    break  # Only renew the matching subscription
+        else:
+            logger.warning(f"Subscription for object {obj_id} not found. Renewal failed.")
 
-class BasicCOVDetection(COVDetectionAlgorithm):
-    def __init__(self):
-        super().__init__(["presentValue", "statusFlags"], ["presentValue", "statusFlags"])
-    def execute(self):
-        pass
-        
-class AnalogValueCOVDetection(COVDetectionAlgorithm):
-    def __init__(self, object_reference, bacnet_manager):
-        super().__init__(object_reference, bacnet_manager)
-        self.threshold = 0.1  # Default threshold for change detection
+    def do_UnsubscribeCOVRequest(self, apdu):
+        """Unsubscribe from COV notifications."""
+        logger.info(f"Received UnsubscribeCOVRequest from {apdu.pduSource}")
+        subscriber_process_id = apdu.subscriberProcessIdentifier
+        obj_id = apdu.monitoredObjectIdentifier
 
-    def execute(self):
-        obj_id = self.object_id
-        prop_id = self.property_ids[0]
-        current_value = bacnet_manager.read_property(object_id=obj_id, property_id=prop_id)
-        previous_value = self.get_previous_value(obj_id, prop_id)
-        difference = abs(current_value - previous_value)
-        if difference > self.delta:
-            self.send_cov_notifications(obj_id, prop_id, current_value)
-            self.store_previous_value(obj_id, prop_id, current_value)
+        if obj_id in self.cov_subscriptions:
+            # Cancel any scheduled renewal timers and remove the subscription for the given subscriberProcessIdentifier
+            for i, subscription in enumerate(self.cov_subscriptions[obj_id]):
+                if subscription[4] == subscriber_process_id:
+                    _, _, _, timer, _ = subscription
+                    if timer:
+                        timer.cancel()
+                    del self.cov_subscriptions[obj_id][i]
+                    break
 
-    def send_cov_notifications(self, obj_id, prop_id, value):
-        print(f"COV detected: object {obj_id}, property {prop_id}, new value: {value}")
+            # If there are no more subscriptions for this object, stop the check_object_values timer
+            if not self.cov_subscriptions[obj_id]:
+                if hasattr(self, '_value_check_timer') and self._value_check_timer.is_alive():
+                    self._value_check_timer.cancel()
+                    del self._value_check_timer
+                    logger.info("Stopped checking object values for changes as there are no more subscriptions")
 
-    def store_previous_value(self, obj_id, prop_id, value):
-        pass
+        self.send_ack(SimpleAckPDU(context=apdu))  # Acknowledge the unsubscription
 
-    def get_previous_value(self, obj_id, prop_id):
-        pass
+    def check_object_values(self):
+        """Periodically check object values for changes and send notifications."""
+        threading.Timer(5, self.check_object_values).start()  # Reschedule the check
 
-    def handle_new_value(self, value):
-        # Implement logic for threshold detection or rate of change monitoring
-        previous_value = self.get_notification_data()
-        if abs(value - previous_value) > self.threshold:
-            # Change detected, trigger custom action (e.g., notification)
-            print(f"Significant change detected for {self.object_reference}: {previous_value} -> {value}")
+        for obj_id, subscriptions in self.cov_subscriptions.items():
+            try:
+                result = self.read(f'{obj_id}')
+                if result and isinstance(result, ReadPropertyACK):
+                    # Assuming the first element of value is what we want to monitor
+                    present_value = result.propertyValue[0].value[0]
 
-    def get_notification_data(self):
-        return self.bacnet_manager.cov_manager.get_previous_value(self.object_reference)
+                    if obj_id not in self.object_values or present_value != self.object_values[obj_id]:
+                        self.object_values[obj_id] = present_value
 
-def subscribe_to_changes(object_reference, property_id, bacnet_manager, callback=None, monitor_type=None):
-    if not bacnet_manager.cov_manager:
-        print("COV manager not available for subscriptions")
-        return None
+                        # Send notifications only to subscribers who requested confirmed notifications
+                        for subscription in subscriptions:
+                            confirmed_notifications, _, pduSource, _, subscriberProcessId = subscription
+                            if confirmed_notifications:
+                                self.send_cov_notification(
+                                    obj_id,
+                                    present_value,
+                                    subscriberProcessId=subscriberProcessId,
+                                    destination=pduSource
+                                )
+            except Exception as error:
+                logger.error(f"Error checking object value for {obj_id}: {error}")
 
-    # Implement logic to create a COV subscription message based on monitor_type
-    subscription = COVSubscription(
-        object_reference,
-        bacnet_manager.get_client_address(),
-        0,  # Process ID (can be incremented for multiple subscriptions)
-        property_id,
-        confirmed=True,  # Use confirmed subscriptions for reliable change detection
-        lifetime=255,  # Set a subscription lifetime (e.g., 255 seconds)
-    )
+    def send_cov_notification(self, obj_id, value, subscriberProcessId, destination):
+        """Send a confirmed COV notification."""
+        # Construct the notification APDU
+        apdu = ConfirmedCOVNotificationRequest(
+            subscriberProcessIdentifier=subscriberProcessId,
+            initiatingDeviceIdentifier=self.this_device.objectIdentifier,
+            monitoredObjectIdentifier=obj_id,
+            timeRemaining=Unsigned(60)  # Assuming 1 minute lifetime for the notification
+        )
 
-    # Choose COV monitor based on monitor_type or object type
-    if monitor_type:
-        cov_monitor = monitor_type(object_reference, bacnet_manager)
-    else:
-        cov_monitor = bacnet_manager.cov_manager._get_cov_monitor(object_reference)
-    subscription.cov_monitor = cov_monitor
+        # Add the property value to the APDU
+        datatype = get_datatype(obj_id.objectType, "presentValue")
+        apdu.listOfValues = ArrayOf(datatype)
+        apdu.listOfValues.append(bacpypes.primitivedata.encode_application_data(value))
 
-    try:
-        bacnet_manager.cov_manager.subscribe(subscription)
-        if callback:
-            # Define a separate notification handling function
-            def handle_notification(value):
-                callback(object_reference, property_id, value)
-            cov_monitor.handle_new_value = handle_notification
-        return subscription
-    except Exception as e:
-        print(f"Error subscribing to changes: {e}")
-        return None
+        # Send the APDU
+        logger.info(f"Sending ConfirmedCOVNotificationRequest to {destination} for {obj_id}")
+        self.request(apdu, destination)
+
+
 
 class BACnetClient:
-    def __init__(self, address: str):
-        self.address = address
-        self.network = bacpypes.network.Network()
-        self.cov_manager = COVManager(self.network)
-        self.bbmd_discoverer = None        
-        self.logger = logging.getLogger(__name__)        
+    def __init__(self, bbmd_address, device_name='Custom-Client', device_id=1234):
+        self.bbmd_address = bbmd_address
+        self.app = CustomCOVApplication(device_name, device_id, bacpypes.local.BIPLocalAddress(), bbmd_address)
+        self.logger = logging.getLogger(__name__)
+        self.devices = []
 
-    def discover_devices(self) -> list[str]:
-        devices = []
+    def discover_devices(self) -> list[dict]:
+        """Discover BACnet devices through the BBMD."""
+        logger.info("Discovering devices...")
+        who_is = WhoIsRequest()
+        self.app.request(who_is)
+        # Add a small delay to allow for responses
+        deferred(self._get_discovered_devices, 1.0)  
+        return self.devices  # Return the populated list of devices
+
+    def _get_discovered_devices(self):
+        """Store Discovered devices in a list"""
+        self.devices = []  # Reset the devices list before re-populating
+        for device in self.app.discoveredDevices:
+            device_dict = {
+                'device_id': device.iAmDeviceIdentifier,
+                'device_address': device.pduSource,
+                'device_name': device.objectName,
+                'max_apdu_length_accepted': device.maxApduLengthAccepted,
+                'segmentation_supported': device.segmentationSupported,
+                'vendor_id': device.vendorID,
+            }
+            self.devices.append(device_dict)
+
+    def read_property(self, object_identifier, property_id):
+        """Reads a property from a BACnet object."""
         try:
-            if BBMDManager:
-                bbmd_manager = BBMDManager()
-                bdt_table = bbmd_manager.get_bdt_table()
-                if bdt_table:
-                    for address, _ in bdt_table.items():
-                        devices.append(address)
-        except ImportError:
-            self.logger.warning("BBMDManager not found. Device discovery skipped.")
-        return devices
-
-    def read_property(self, object_identifier: BACnetObjectIdentifier, property_id: int) -> Optional[Any]:
-
-      # Validate input
-      if not validateObjectId(object_identifier):
-        raise ValueError("Invalid object identifier provided")
-
-      try:
-        # Use network.send_pdu to send the request
-        response = self.network.send_pdu(
-            ReadPropertyRequest(
-                objectIdentifier=object_identifier,
-                propertyIdentifier=property_id,
+            iocb = self.app.read(
+                f'{object_identifier}/{property_id}'
             )
-        )
+            if iocb.ioResponse:
+                apdu = iocb.ioResponse
+                if not isinstance(apdu, ReadPropertyACK):
+                    raise ValueError("ReadProperty did not succeed, got: {apdu}")
+                # Here you extract the value from the APDU
+                return apdu.propertyValue[0].value[0]
+        except (CommunicationError, BACnetError) as e:
+            self.logger.error(f"Error reading property: {e}")
 
-        # Check for valid response and error codes
-        if not response or response.pdu.serviceChoice != ServiceChoice.READ_PROPERTY_RESPONSE:
-          raise BACnetError(f"Error reading property: {object_identifier}:{property_id}")
-        elif response.pdu.errorCode != bacpypes.StatusCode.DEVICE_STATUS_ERROR:
-          raise BACnetError(f"BACnet error: {response.pdu.errorCode.name}")
-
-        # Return the property value
-        return response.pdu.valueList[0].value
-
-      except (CommunicationError, BACnetError) as e:
-        # Handle errors, log them, or raise for further handling
-        self.logger.error(f"Error reading property: {e}")
-        return None
-
-      except Exception as e:
-        # Catch unexpected exceptions and log them
-        self.logger.error(f"Unexpected error while reading property: {e}")
-        return None
-    
-    def write_property(self, object_identifier: BACnetObjectIdentifier, property_id: int, value: Any):
-
-      # Validate input
-      if not validateObjectId(object_identifier):
-        raise ValueError("Invalid object identifier provided")
-
-      # Check if value type matches property type (optional)
-      # Implement logic to validate value based on property ID (e.g., using BACnet library)
-
-      try:
-        # Use network.send_pdu to send the request
-        self.network.send_pdu(
-            WritePropertyRequest(
-                objectIdentifier=object_identifier,
-                propertyIdentifier=property_id,
-                valueList=[bacpypes.cast(value)],  # Cast value to appropriate BACnet type
+    def write_property(self, object_identifier, property_id, value):
+        """Writes a property to a BACnet object."""
+        try:
+            iocb = self.app.write(
+                f'{object_identifier}/{property_id}:{value}'
             )
-        )
+            # check for success
+            if iocb.ioError:
+                self.logger.error(f"Error writing property: {iocb.ioError}")
+        except (CommunicationError, BACnetError) as e:
+            self.logger.error(f"Error writing property: {e}")
 
-      except (CommunicationError, BACnetError) as e:
-        # Handle communication and BACnet errors
-        raise BACnetError(f"Error writing property: {object_identifier}:{property_id} - {e}") from e
+    def subscribe_to_changes(self, object_identifier, property_id, callback=None, confirmed_notifications=True, lifetime=None):
+        """Subscribe to COV notifications for the specified object and property."""
+        try:
+            self.app.do_SubscribeCOVRequest(
+                SubscribeCOVRequest(
+                    monitoredObjectIdentifier=object_identifier,
+                    issueConfirmedNotifications=confirmed_notifications,
+                    subscriberProcessIdentifier=0,  # Assuming only one subscriber for now,
+                    lifetime=Unsigned(lifetime) if lifetime else None
+                )
+            )
+            if callback:
+                subscriptions[(object_identifier, property_id)] = callback
+                logging.info(f"Subscribed to changes for object: {object_identifier}, property: {property_id}")
+        except (CommunicationError, BACnetError) as e:
+            logger.error(f"Error subscribing to changes: {e}")
 
-      except Exception as e:
-        # Catch unexpected exceptions and log them
-        self.logger.error(f"Unexpected error while writing property: {e}")
-    
-    def subscribe_to_changes(self, object_identifier: BACnetObjectIdentifier, property_id: int, callback=None):
-        if self.cov_manager:
-            self.cov_manager.subscribe(object_identifier, property_id, callback)
-        else:
-            self.logger.warning("COVManager not initialized. Subscription failed.")
-    
-    def handle_received_data(self, data: bytes):
-        if data and data[0] == 0x00:
-            self.logger.debug("Received UnconfirmedCOVNotification")
-            self.cov_manager.process_unconfirmed_cov(data)
-    
-    def process_cov_notification(self, apdu):
-        """Processes a COV notification APDU and extracts the new value."""
-        if not apdu:
-            return
-        
-        object_reference = apdu.decode_object_reference()
-        property_id = apdu.decode_property_id()
-
-        # Extract new value based on property type
-        if apdu.get_context_specific(0).datatype == bacpypes.basic.UnsignedInteger:
-            new_value = apdu.decode_context_specific_unsigned(0)
-        elif apdu.get_context_specific(0).datatype == bacpypes.basic.Boolean:
-            new_value = apdu.decode_context_specific_boolean(0)
-        # ... (handle other data types as needed)
-        else:
-            self.logger.warning(f"Unsupported data type for COV notification: {apdu.get_context_specific(0).datatype}")
-            return
-
-        print(f"Received COV notification for object: {object_reference}")
-        print(f"Property ID: {property_id}, New Value: {new_value}")
 
 def main():
-  """
-  Main function.
-  """
+    # Replace with the actual BBMD address and port
+    bbmd_address = ("your_bbmd_ip_address", 47808)
 
-  # JSON filename (replace with your desired filename)
-  filename = "bbmds_and_discovered_devices.json"
+    # Initialize the client
+    client = BACnetClient(bbmd_address, device_name="BACnetCOVClient", device_id=123) 
+    # Discover BBMDs on the network
+    client.app.discover_remote_devices()
+    time.sleep(2)  # Give some time for discovery to complete
 
-  # Container for BBMD data with discovered devices
-  bbmd_data = {
-      "bbmds": []
-  }
+    # BBMD Discovery Test
+    if client.app.discoveredDevices:
+        logging.info("BBMD Discovery Test: PASS")
+    else:
+        logging.error("BBMD Discovery Test: FAIL - No BBMDs found.")
 
-  # Open the JSON file for read and update
-  try:
-    with open(filename, "r+") as f:
-      try:
-        # Attempt to load existing data (if any)
-        bbmd_data = json.load(f)
-      except json.JSONDecodeError:
-        # Ignore loading errors if the file is empty
-        pass
+    # Device Discovery Test
+    devices = client.discover_devices()
 
-      # Loop through BBMD entries in the JSON structure (or an empty list)
-      for bbmd_entry in bbmd_data["bbmds"]:
-        address = bbmd_entry.get("address")
-        port = bbmd_entry.get("port", 47848)  # Use default port if not specified
+    if devices:
+        logging.info("Device Discovery Test: PASS")
+        # Pick the first device for testing
+        device = devices[0]
+        object_identifier = device['device_id']
+        logging.info(f"Found devices: {[device['device_id'] for device in devices]}")
+    else:
+        logging.error("Device Discovery Test: FAIL - No devices found.")
+        return
 
-        # Initialize BACnet client with BBMD address
-        bacnet_client = BACnetClient(address)
+    # Property Reading Test
+    property_value = client.read_property(object_identifier, 85)  # Read Object Name
+    if property_value is not None:
+        logging.info(f"Property Reading Test: PASS - Read property value: {property_value}")
+    else:
+        logging.error(f"Property Reading Test: FAIL - Could not read property 85 (Object Name) from device {object_identifier}.")
 
-        # Discover devices using the BACnet client
-        devices = bacnet_client.discover_devices()
+    # Property Writing Test (optional, uncomment if applicable)
+    # Uncomment this if you have write access to a property on your device
+    # try:
+    #     client.write_property(object_identifier, 85, "New Name")
+    #     logging.info("Property Writing Test: PASS")
+    # except Exception as e:
+    #     logging.error(f"Property Writing Test: FAIL - {e}")
 
-        # Update discovered devices for this BBMD entry
-        bbmd_entry["discovered_devices"] = [{"address": device} for device in devices]
 
-      # Write the entire JSON data (including BBMDs and discovered devices)
-      f.seek(0)  # Move to the beginning of the file
-      json.dump(bbmd_data, f, indent=4)
-      print(f"Discovered devices written to {filename}")
-  except Exception as e:
-    print(f"Error writing discovered devices to JSON: {e}")
+    # COV Subscription Test
+    def cov_callback(obj_id, prop_id, value):
+        logging.info(f"COV Notification: Object {obj_id}, Property {prop_id}, Value: {value}")
+
+    subscription = client.subscribe_to_changes(object_identifier, 85, cov_callback, lifetime=60) # subscribe for 60 seconds
+    if subscription is not None:
+        logging.info(f"COV Subscription Test: PASS - Subscribed to object {object_identifier}, property 85")
+
+        # Wait for a few seconds to see if any notifications arrive (adjust the time as needed)
+        time.sleep(30) 
+    else:
+        logging.error("COV Subscription Test: FAIL - Could not subscribe.")
+
+    # Unsubscribe (optional, uncomment to test unsubscription)
+    # client.app.do_UnsubscribeCOVRequest(subscription)
+
+    while True:
+        run()
+
 
 if __name__ == "__main__":
-  main()
-        
+    main()
+
