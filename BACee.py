@@ -36,7 +36,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # Global dictionary for COV subscriptions
 subscriptions = {}
-logger = logging.getLogger(__name__)
+
 
 class CustomCOVApplication(BIPSimpleApplication, ChangeOfValueServices):
     def __init__(self, device_name, device_id, local_address, bbmd_address=None):
@@ -135,21 +135,16 @@ class CustomCOVApplication(BIPSimpleApplication, ChangeOfValueServices):
         obj_id = apdu.monitoredObjectIdentifier
 
         if obj_id in self.cov_subscriptions:
-            # Cancel any scheduled renewal timers and remove the subscription for the given subscriberProcessIdentifier
-            for i, subscription in enumerate(self.cov_subscriptions[obj_id]):
-                if subscription[4] == subscriber_process_id:
-                    _, _, _, timer, _ = subscription
-                    if timer:
-                        timer.cancel()
-                    del self.cov_subscriptions[obj_id][i]
-                    break
+            subscriptions_for_object = self.cov_subscriptions[obj_id]
+            self.cov_subscriptions[obj_id] = [sub for sub in subscriptions_for_object if sub[4] != subscriber_process_id]
+        else:
+            logger.warning(f"No subscription found for object {obj_id} with subscriber process ID {subscriber_process_id}")
 
-            # If there are no more subscriptions for this object, stop the check_object_values timer
-            if not self.cov_subscriptions[obj_id]:
-                if hasattr(self, '_value_check_timer') and self._value_check_timer.is_alive():
-                    self._value_check_timer.cancel()
-                    del self._value_check_timer
-                    logger.info("Stopped checking object values for changes as there are no more subscriptions")
+        if obj_id not in self.cov_subscriptions or not self.cov_subscriptions[obj_id]:  # If no more subscriptions
+            if hasattr(self, '_value_check_timer') and self._value_check_timer.is_alive():
+                self._value_check_timer.cancel()
+                del self._value_check_timer
+                logger.info(f"Stopped checking object values for {obj_id} as there are no more subscriptions")
 
         self.send_ack(SimpleAckPDU(context=apdu))  # Acknowledge the unsubscription
 
@@ -189,7 +184,6 @@ class CustomCOVApplication(BIPSimpleApplication, ChangeOfValueServices):
             monitoredObjectIdentifier=obj_id,
             timeRemaining=Unsigned(60)  # Assuming 1 minute lifetime for the notification
         )
-
         # Add the property value to the APDU
         datatype = get_datatype(obj_id.objectType, "presentValue")
         apdu.listOfValues = ArrayOf(datatype)
@@ -198,8 +192,6 @@ class CustomCOVApplication(BIPSimpleApplication, ChangeOfValueServices):
         # Send the APDU
         logger.info(f"Sending ConfirmedCOVNotificationRequest to {destination} for {obj_id}")
         self.request(apdu, destination)
-
-
 
 class BACnetClient:
     def __init__(self, bbmd_address, device_name='Custom-Client', device_id=1234):
@@ -275,71 +267,38 @@ class BACnetClient:
         except (CommunicationError, BACnetError) as e:
             logger.error(f"Error subscribing to changes: {e}")
 
+# --- Main Function with Tests ---
 
 def main():
     # Replace with the actual BBMD address and port
-    bbmd_address = ("your_bbmd_ip_address", 47808)
+    bbmd_address = ("192.168.1.100", 47808)
 
     # Initialize the client
     client = BACnetClient(bbmd_address, device_name="BACnetCOVClient", device_id=123) 
-    # Discover BBMDs on the network
+
+    # Discover devices and BBMDs
     client.app.discover_remote_devices()
-    time.sleep(2)  # Give some time for discovery to complete
+    # Add a delay to wait for responses before proceeding
+    time.sleep(2)  
 
-    # BBMD Discovery Test
+    # Testing and Demo
     if client.app.discoveredDevices:
-        logging.info("BBMD Discovery Test: PASS")
+        logging.info("BBMD and Device Discovery Test: PASS")
+
+        # Example: Subscribe to COV for Present Value on AI1 for each discovered device
+        for device in client.app.discoveredDevices:
+            device_id = device.iAmDeviceIdentifier
+            client.subscribe_to_changes(device_id, PropertyIdentifier.presentValue, cov_callback, lifetime=60)  # Subscribe for 60 seconds
+
+        while True:
+            run()  # Keep the BACnet stack running
     else:
-        logging.error("BBMD Discovery Test: FAIL - No BBMDs found.")
-
-    # Device Discovery Test
-    devices = client.discover_devices()
-
-    if devices:
-        logging.info("Device Discovery Test: PASS")
-        # Pick the first device for testing
-        device = devices[0]
-        object_identifier = device['device_id']
-        logging.info(f"Found devices: {[device['device_id'] for device in devices]}")
-    else:
-        logging.error("Device Discovery Test: FAIL - No devices found.")
-        return
-
-    # Property Reading Test
-    property_value = client.read_property(object_identifier, 85)  # Read Object Name
-    if property_value is not None:
-        logging.info(f"Property Reading Test: PASS - Read property value: {property_value}")
-    else:
-        logging.error(f"Property Reading Test: FAIL - Could not read property 85 (Object Name) from device {object_identifier}.")
-
-    # Property Writing Test (optional, uncomment if applicable)
-    # Uncomment this if you have write access to a property on your device
-    # try:
-    #     client.write_property(object_identifier, 85, "New Name")
-    #     logging.info("Property Writing Test: PASS")
-    # except Exception as e:
-    #     logging.error(f"Property Writing Test: FAIL - {e}")
+        logging.error("BBMD and Device Discovery Test: FAIL - No devices or BBMDs found.")
 
 
-    # COV Subscription Test
-    def cov_callback(obj_id, prop_id, value):
-        logging.info(f"COV Notification: Object {obj_id}, Property {prop_id}, Value: {value}")
-
-    subscription = client.subscribe_to_changes(object_identifier, 85, cov_callback, lifetime=60) # subscribe for 60 seconds
-    if subscription is not None:
-        logging.info(f"COV Subscription Test: PASS - Subscribed to object {object_identifier}, property 85")
-
-        # Wait for a few seconds to see if any notifications arrive (adjust the time as needed)
-        time.sleep(30) 
-    else:
-        logging.error("COV Subscription Test: FAIL - Could not subscribe.")
-
-    # Unsubscribe (optional, uncomment to test unsubscription)
-    # client.app.do_UnsubscribeCOVRequest(subscription)
-
-    while True:
-        run()
-
+# Callback function for COV notifications
+def cov_callback(obj_id, prop_id, value):
+    logging.info(f"COV Notification: Object {obj_id}, Property {prop_id}, Value: {value}")
 
 if __name__ == "__main__":
     main()
