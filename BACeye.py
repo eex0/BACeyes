@@ -2121,34 +2121,55 @@ async def main():
         
     # **************************************************************************
         
-    # BACnet Application Setup (with timeouts)
-    timeout_seconds = 3  # Set your default timeout value here
+    # BACnet Application Setup (async task handling)
+    tasks = set()  # Set to keep track of running tasks
     try:
+        logger.info("Starting BACnet application...")
         app = BACeeApp(LOCAL_ADDRESS, DEVICE_ID, DEVICE_NAME)
 
-        # Start BACnet application (potentially long-running)
-        bacnet_start_task = asyncio.create_task(app.start())
-        await asyncio.wait_for(bacnet_start_task, timeout=timeout_seconds)
+        async def start_and_register_bbmd():
+            await app.start()
+            if app.bbmd:
+                await app.bbmd.register_foreign_device()
 
-        # Register with BBMD (if available)
-        if app.bbmd:
-            bbmd_register_task = asyncio.create_task(app.bbmd.register_foreign_device())
-            await asyncio.wait_for(bbmd_register_task, timeout=timeout_seconds)
+        # Create task for BACnet start and BBMD registration
+        bacnet_task = asyncio.create_task(start_and_register_bbmd())
+        tasks.add(bacnet_task)
 
-        # Start subscription and alarm management tasks (might run indefinitely)
-        subscription_task = asyncio.create_task(app.manage_subscriptions())
-        alarm_task = asyncio.create_task(app.manage_alarms())
-        cli_task = asyncio.create_task(cli_loop(app))
+        # Create tasks for subscription, alarm management, and CLI loop
+        tasks.update(
+            asyncio.create_task(coro)
+            for coro in [app.manage_subscriptions(), app.manage_alarms(), cli_loop(app)]
+        )
 
         # Start API server (typically runs continuously)
-        api_server_task = asyncio.create_task(socketio.run(app_flask, host="0.0.0.0", port=5000))
+        api_server_task = asyncio.create_task(
+            socketio.run(app_flask, host="0.0.0.0", port=5000)
+        )
+        tasks.add(api_server_task)  # Add to the set of tasks
 
-        # Wait for any of these tasks to complete (e.g., due to error or shutdown)
-        await asyncio.wait([subscription_task, alarm_task, cli_task, api_server_task])
+        # Wait for any task to complete (normal or due to error)
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
-    except asyncio.TimeoutError:
-        logger.error("Timeout occurred during BACnet operations.")
-        # Handle the timeout gracefully (e.g., clean up resources, log details)
+        # Handle the finished task (optional, depending on your needs)
+        for done_task in done:
+            try:
+                await done_task  # Ensure task is awaited
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:  # Catch exceptions that might occur in the task
+                logger.exception("An error occurred in task:", exc_info=e)
+
+        # Cancel any pending tasks
+        for task in pending:
+            task.cancel()
+            try:
+                await task  # Wait for the cancellation to complete
+            except asyncio.CancelledError:
+                pass
+
+    except Exception as e:
+        logger.exception("An error occurred in the main function:", exc_info=e)
 
 
 if __name__ == '__main__':
