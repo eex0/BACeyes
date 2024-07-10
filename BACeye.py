@@ -1952,7 +1952,31 @@ async def handle_alarms():
 @auth.login_required
 async def acknowledge_alarm():
     """API endpoint to acknowledge an alarm."""
-    # Implement acknowledgment logic here
+    try:
+        data = request.get_json()
+        device_id = data.get('deviceId')
+        object_id = data.get('objectId')
+        property_id = data.get('propertyId')
+        alarm_type = data.get('alarmType')
+
+        if not all([device_id, object_id, property_id, alarm_type]):
+            return jsonify({"error": "Missing required parameters"}), 400
+
+        # Create the alarm_key tuple
+        alarm_key = (device_id, tuple(object_id), property_id, alarm_type)
+
+        # Verify if the alarm is active
+        if alarm_key not in app.alarm_manager.active_alarms:
+            return jsonify({"error": "Alarm not found or already acknowledged"}), 404
+
+        # Acknowledge the alarm
+        await app.alarm_manager.acknowledge_alarm(alarm_key)
+
+        return jsonify({"message": f"Alarm {alarm_type} on {object_id} of device {device_id} acknowledged successfully"}), 200
+    
+    except (ValueError, KeyError) as e:
+        _logger.error(f"Error acknowledging alarm: {e}")
+        return jsonify({"error": "Invalid request data"}), 400
 
 @app_flask.route('/alarms/silence', methods=['POST'])
 @auth.login_required
