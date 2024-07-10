@@ -720,7 +720,29 @@ class AlarmManager:
             message_content += f"\nRecent Trend: {trend_info}"
 
         return message_content
-        
+
+    def _calculate_trend(self, history, threshold=0.05):  # Add a threshold parameter
+        """Calculates a trend from the given history based on a percentage change threshold."""
+
+        if len(history) < 2:
+            return "Insufficient data"
+
+        timestamps, values = zip(*history)
+        start_value = values[0]
+        end_value = values[-1]
+        percentage_change = (end_value - start_value) / abs(start_value) if start_value != 0 else 0
+
+        if percentage_change > threshold:
+            return "Increasing rapidly"
+        elif percentage_change < -threshold:
+            return "Decreasing rapidly"
+        elif percentage_change > 0:
+            return "Increasing"
+        elif percentage_change < 0:
+           return "Decreasing"
+        else:
+            return "Stable" 
+            
     # In the trigger_alarm function
     # await self.send_alarm_notification(alarm_key)  # Initial notification (level 1)
 
