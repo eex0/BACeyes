@@ -837,22 +837,40 @@ class AlarmManager:
         # Implementation for sending the reminder notification
 
     async def acknowledge_alarm(self, alarm_key):
-        """Acknowledges an alarm, moving it from active to acknowledged."""
-        if alarm_key in self.active_alarms:
-            _logger.info(f"Acknowledging alarm {alarm_key}")
-            self.acknowledged_alarms.add(alarm_key)
-            del self.active_alarms[alarm_key]  # Remove from active alarms
+        """Acknowledges an alarm, moving it from active to acknowledged and updates the database."""
 
-            # Optional: Update the database to mark the alarm as acknowledged
-            try:
+        try:
+            if alarm_key in self.active_alarms:
+                logger.info(f"Acknowledging alarm {alarm_key}")
+
+                # Move alarm to acknowledged set
+                self.acknowledged_alarms.add(alarm_key)
+
+                # Remove from active alarms
+                del self.active_alarms[alarm_key]
+
+                # Update the database to mark the alarm as acknowledged
+                await self.update_alarm_acknowledgment_in_db(alarm_key, acknowledged=True)
+
+                # Additional actions on acknowledgment (e.g., notification) can be added here
+            else:
+                logger.warning(f"Alarm {alarm_key} not found in active alarms. Cannot acknowledge.")
+        except Exception as e:
+            logger.exception(f"An unexpected error occurred while acknowledging alarm {alarm_key}: {e}")
+    
+
+    async def update_alarm_acknowledgment_in_db(self, alarm_key, acknowledged):
+        """Updates the acknowledgment status of an alarm in the database."""
+        try:
+            with self.app.db_conn:  # Use context manager for automatic transactions
                 cursor = self.app.db_conn.cursor()
+                device_id, obj_id, prop_id, alarm_type = alarm_key
                 cursor.execute(
-                    "UPDATE alarms SET acknowledged = 1 WHERE id = ?",
-                    (alarm_key[0][1],)  # Assuming the first element of alarm_key is a tuple (device_id,)
-                )
-                self.app.db_conn.commit()
-            except sqlite3.Error as e:
-                _logger.error(f"Error acknowledging alarm in database: {e}")
+                    "UPDATE alarms SET acknowledged = ? WHERE device_id = ? AND object_id = ? AND property_id = ? AND alarm_type = ?",
+                    (acknowledged, device_id, str(obj_id), prop_id, alarm_type)
+                )  
+        except sqlite3.Error as e:
+            logger.error(f"Error updating alarm acknowledgment in database: {e.args[0]}")
 
     def save_cov_notification_to_db(self, device_id, obj_id, prop_id, value):
         try:
