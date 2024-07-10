@@ -1249,7 +1249,7 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
         try:
             device_id = apdu.initiatingDeviceIdentifier
             device_info = self.deviceInfoCache.get_device_info(device_id)
-        
+
             if not device_info:
                 _logger.warning(f"Received COV notification from unknown device: {device_id}")
                 return
