@@ -1452,8 +1452,14 @@ class TrendAnalyzer:
 
 # ******************************************************************************
 
-
 # Helper functions for CLI interactions
+
+async def async_input(prompt: str) -> str:
+    """Get input from the user asynchronously."""
+    # Wrap input() in an executor to run it in a separate thread
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, input, prompt)
+    
 async def handle_create_subscription(app):
     """Handles the process of creating a subscription."""
     # Display discovered devices for user selection
