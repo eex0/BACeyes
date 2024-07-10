@@ -836,32 +836,41 @@ class AlarmManager:
 class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._log = ModuleLogger(globals())  # Use ModuleLogger
- 
-        self.registered_devices = {}
-        self.deviceInfoCache = DeviceInfoCache(self.this_device)
-        
+        self._log = ModuleLogger(globals())
         self.subscriptions = {}
+        
+        # Create the LocalDeviceObject instance
         self.this_device = LocalDeviceObject(
-            objectName=DEVICE_NAME, objectIdentifier=('device', DEVICE_ID)
+            objectName=DEVICE_NAME,
+            objectIdentifier=('device', DEVICE_ID),
+            maxApduLengthAccepted=1024,  # Set maximum APDU length (adjust as needed)
+            segmentationSupported='segmentedBoth',  # Specify segmentation support
         )
-        self.this_application = self
+        
+        # Create and bind the Network Service Elements
         self.nsap = NetworkServiceAccessPoint()
         self.nse = NetworkServiceElement()
         bind(self.nse, self.nsap)
         bind(self, self.nse)
 
-        # Simple BBMD configuration
-        settings().add_address_binding(
-            Address(LOCAL_ADDRESS),
-            bind(BIPForeign(BBMD_ADDRESS), UDPMultiplexer()),
-        )
+        # Initialize the DeviceInfoCache
+        self.deviceInfoCache = DeviceInfoCache(self.this_device)
 
-        # Add local device object
-        self.this_device.add_object(AnalogInputObject(objectIdentifier=('analogInput', 1), presentValue=0.0))
-        self.bbmd = None  # Initialize BBMD to None
-        self.bbmd.app = self
+        # Simple BBMD configuration (if applicable)
+        if BBMD_ADDRESS:
+            # Check if BBMD address is different from the local address
+            if BBMD_ADDRESS != Address(LOCAL_ADDRESS):
+                settings().add_address_binding(
+                    Address(LOCAL_ADDRESS), bind(BIPForeign(BBMD_ADDRESS), UDPMultiplexer()),
+                )
+                self.bbmd = BBMD(Address(BBMD_ADDRESS))
+                self.bbmd.app = self
+            else:
+                _logger.warning("BBMD address is the same as the local address. BBMD configuration skipped.")
+        else:
+            _logger.warning("BBMD address not provided in configuration. BBMD configuration skipped.")
 
+        # Other initializations...
         self.acknowledged_alarms = set()
         self.active_alarms = {}
         self.cov_history = defaultdict(lambda: defaultdict(list))
