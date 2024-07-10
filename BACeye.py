@@ -108,7 +108,8 @@ BBMD_ADDRESS = local_device_config.get("bbmd_address", "192.168.1.255")
 
 class Subscription:
     def __init__(self, device_id, obj_id, prop_id, confirmed_notifications=True, lifetime_seconds=None,
-                    change_filter=None, priority=None):
+        change_filter=None, priority=None,
+    ):
         self.device_id = device_id
         self.obj_id = obj_id
         self.prop_id = prop_id
@@ -118,12 +119,15 @@ class Subscription:
         self.change_filter = change_filter
         self.priority = priority
         self.alarms = []
+        self.context_manager = None  # To store the SubscriptionContextManager
 
 
     async def renew_subscription(self, app: BACeeApp, timeout: int = 5):
         """Renews the COV subscription."""
         if not self.active:
-            _logger.warning(f"Trying to renew an inactive subscription for {self.obj_id}.{self.prop_id}")
+            _logger.warning(
+                f"Trying to renew an inactive subscription for {self.obj_id}.{self.prop_id}"
+            )
             return
 
         _logger.info(f"Renewing COV subscription for {self.obj_id}.{self.prop_id}")
@@ -131,10 +135,12 @@ class Subscription:
         try:
             # Use existing context manager
             await app.subscribe_cov(self, renew=True)
-            
+
             _logger.info(f"Renewed COV subscription for {self.obj_id}.{self.prop_id}")
         except (CommunicationError, TimeoutError, asyncio.TimeoutError) as e:
-            _logger.warning(f"Error renewing subscription for {self.obj_id}.{self.prop_id}: {e}")
+            _logger.warning(
+                f"Error renewing subscription for {self.obj_id}.{self.prop_id}: {e}"
+            )
             self.active = False  # Mark subscription as inactive on error
 
                     
