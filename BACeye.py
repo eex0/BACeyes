@@ -14,9 +14,11 @@
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import time
 import re
+import sys
 import sqlite3
 from datetime import datetime
 from collections import defaultdict
@@ -76,18 +78,34 @@ from flask_socketio import disconnect
 
 # ******************************************************************************
 
-# Logging configuration
+# Logging Configuration (with Console and File Logging)
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.handlers.RotatingFileHandler(
+            "bacee.log", maxBytes=1024 * 1024 * 5, backupCount=5
+        ),
+        logging.StreamHandler(sys.stdout)  # Add console handler
+    ]
 )
-_logger = logging.getLogger(__name__)
-handler = logging.handlers.RotatingFileHandler(
-    "bacee.log", maxBytes=1024 * 1024 * 5, backupCount=5
-)
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-handler.setFormatter(formatter)
-_logger.addHandler(handler)
 
+logger = logging.getLogger(__name__)
+
+# if you have many msgs use: only warnings, errors, and critical messages will appear in the console
+# console_handler = logging.StreamHandler(sys.stdout)
+# console_handler.setLevel(logging.WARNING)  # Only WARNING and above to console
+
+# logging.basicConfig(
+#     level=logging.INFO, 
+#     format="%(asctime)s - %(levelname)s - %(message)s",
+#     handlers=[
+#         logging.handlers.RotatingFileHandler(
+#             "bacee.log", maxBytes=1024 * 1024 * 5, backupCount=5
+#         ),
+#         console_handler
+#     ]
+# )
 
 # ******************************************************************************
 
