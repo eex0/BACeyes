@@ -2026,9 +2026,78 @@ async def silence_alarm():
 
 def start_api_server():
     app_flask.run(host="0.0.0.0", port=5000)  # Start on all interfaces, port 5000
+# Configuration Validation Function (refactored)
+def validate_configurations(configurations, validation_rules):
+    """Validates configurations using a dictionary of rules."""
+    issues_found = False
+    for key, rule in validation_rules.items():
+        value = configurations.get(key, "") 
+        if not rule(value):
+            logger.error(f"Invalid configuration: {key}={value}")
+            issues_found = True
+    return not issues_found  # Return True if valid
 
-# Main function
+# JSON Validation Function (enhanced)
+def validate_json_file(file_path, schema_file_path=None):
+    """Validates JSON file and optionally against a schema."""
+    try:
+        with open(file_path, "r") as f:
+            data = json.load(f)
+        if schema_file_path:
+            with open(schema_file_path, "r") as f:
+                schema = json.load(f)
+            validate(instance=data, schema=schema)  # Schema validation
+        return True
+    except (json.JSONDecodeError, FileNotFoundError, jsonschema.ValidationError) as e:
+        logger.error(f"JSON validation failed: {e}")
+        return False
+
+# Database Validation Function (example with SQLite)
+def validate_database(db_path):
+    """Validates database connection and schema."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            # Execute schema validation queries here
+            pass
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"Database validation failed: {e}")
+        return False
+
+
 async def main():
+
+    # Load configurations from environment variables or a file
+    configurations = {
+        "BBMD_ADDRESS": os.getenv("BBMD_ADDRESS"),
+        "DEVICE_ID": os.getenv("DEVICE_ID"),
+        # ... other configurations
+    }
+
+    # Define validation rules 
+    validation_rules = {
+        "BBMD_ADDRESS": lambda value: value and ":" in value,
+        "DEVICE_ID": lambda value: value.isalnum(),
+        # ... other rules
+    }
+
+    # Configuration Validation
+    if not validate_configurations(configurations, validation_rules):
+        logger.critical("Configuration validation failed. Exiting.")
+        return  # Exit early if configurations are invalid
+
+    # JSON and Database Validation
+    json_file_path = "config.json"
+    schema_file_path = "config_schema.json"
+    if not validate_json_file(json_file_path, schema_file_path):
+        logger.critical("JSON validation failed. Exiting.")
+        return
+
+    db_path = "mydb.db"
+    if not validate_database(db_path):
+        logger.critical("Database validation failed. Exiting.")
+        return
+
     app = BACeeApp(LOCAL_ADDRESS, DEVICE_ID, DEVICE_NAME)
     await app.start()
 
@@ -2045,6 +2114,6 @@ async def main():
 
     # Start the API server with WebSocket
     socketio.run(app_flask, host="0.0.0.0", port=5000)
-
+    
 if __name__ == '__main__':
     asyncio.run(main())
