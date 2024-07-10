@@ -2026,6 +2026,7 @@ async def silence_alarm():
 
 def start_api_server():
     app_flask.run(host="0.0.0.0", port=5000)  # Start on all interfaces, port 5000
+    
 # Configuration Validation Function (refactored)
 def validate_configurations(configurations, validation_rules):
     """Validates configurations using a dictionary of rules."""
