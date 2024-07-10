@@ -403,38 +403,39 @@ class BBMD:
         """
         Requests the routing table from the BBMD at the specified destination address.
         """
+        _log.debug(f"Requesting routing table from BBMD at {destination_address}")  # Add a debug log
 
         try:
             # Create a request for the routing table
             request = ReadPropertyRequest(
-                objectIdentifier=("device", self.device_id),
-                propertyIdentifier="routingTable",
+                objectIdentifier=('device', self.device_id),
+                propertyIdentifier='routingTable'
             )
             request.pduDestination = Address(destination_address)
 
             # Send the request and wait for the response
-            response = await self.app.bacnet_stack.request(request, timeout=5)
+            try:
+                response = await self.app.bacnet_stack.request(request, timeout=5)
+            except TimeoutError as e:
+                _log.error(f"Timeout error while requesting routing table: {e}")  # Log timeout error
+                return None
 
+            # Handle the response
             if isinstance(response, ReadPropertyACK):
-                # Extract routing table data
-                routing_table = response.propertyValue.cast_out(SequenceOf(SequenceOf(Unsigned)))
-                return routing_table
-
-        except (CommunicationError, TimeoutError) as e:
-            logger.error(f"Error requesting routing table: {e}")
-            return None
-
-        return None  # Return None if no routing table was received or in case of error
-
-
-        except (CommunicationError, TimeoutError) as comm_err:
-            _logger.error(f"Failed to communicate with BBMD: {comm_err}")
-            self.is_available = False  # Mark BBMD as unavailable
-            return []  # Return an empty list to indicate failure
-
+                # Extract and return the routing table
+                try:
+                    routing_table = response.propertyValue.cast_out(SequenceOf(SequenceOf(Unsigned)))
+                    _log.debug(f"Received routing table: {routing_table}")
+                    return routing_table
+                except Exception as e:  # Catch more specific exception if possible
+                    _log.error(f"Error extracting routing table data: {e}")
+                    return None
+            else:
+                _log.warning(f"Unexpected response type: {type(response)}")  # Log unexpected response
+                return None
         except BACpypesError as e:
-            _logger.error(f"Error requesting or parsing routing table: {e}")
-            return []  # Return an empty list on failure
+            _log.error(f"BACpypes error requesting routing table: {e}")  # Log BACpypes error
+            return None
 
 
     def get_destination_address(self, device_id):
