@@ -520,30 +520,34 @@ class AlarmManager:
         prop_id = subscription.prop_id
         device_id = subscription.device_id
 
-        # Get the most recent 10 values for trend analysis (if applicable)
+        # Get the most recent values for trend analysis
         history = self.app.cov_history.get(obj_id, {}).get(prop_id, [])
-        recent_values = history[-10:]  # Get the last 10 values, or fewer if not available
+        recent_values = history[-10:]  # Get last 10 or all if less
 
-        # Change Filtering (if applicable)
+        # Change Filtering
         if subscription.change_filter:
-            previous_value = recent_values[-1][1] if recent_values else None  # Get the last value from history
-            if previous_value is not None and abs(property_value - previous_value) < subscription.change_filter:
-                return  # Skip if the change is below the filter threshold
+            # Check for change filter values
+            if recent_values:
+                previous_value = recent_values[-1][1]
+                if abs(property_value - previous_value) < subscription.change_filter:
+                    return  # Skip if the change is below the filter threshold
+            else:
+                # If no previous value, treat it as a change and don't return
+                pass
 
         # Alarm Flood Detection
         alarm_key = (device_id, obj_id, prop_id)
         if not self.is_alarm_silenced(alarm_key):
             await self.detect_alarm_flood(alarm_key)
 
-        if not self.is_alarm_flood_active(device_id):  # Check flood for the specific device
-            # Alarm Logic (Only if not in alarm flood)
+        # Alarm Logic (Only if not in alarm flood)
+        if not self.is_alarm_flood_active(device_id):
             for alarm in subscription.alarms:
                 alarm_type = alarm["type"]
                 threshold = alarm["threshold"]
                 severity = alarm["severity"]
                 priority = alarm.get("priority")
 
-                # Simplified Alarm Triggering and Clearing
                 full_alarm_key = (*alarm_key, alarm_type)
                 if self._should_trigger_alarm(alarm_type, property_value, threshold):
                     await self.trigger_alarm(
@@ -554,21 +558,26 @@ class AlarmManager:
                         property_value,
                         priority,
                         severity=severity,
-                        history=recent_values  # Pass recent values to trigger_alarm for trend analysis
+                        history=recent_values,
                     )
                 elif full_alarm_key in self.active_alarms:
                     await self.clear_alarm(*full_alarm_key)
 
-            # Anomaly Detection (Using Z-Score)
-            if len(recent_values) >= 2:
-                timestamps, values = zip(*recent_values)
-                z_scores = (np.array(values) - np.mean(values)) / np.std(values)
-
-                for i, z in enumerate(z_scores):
-                    if abs(z) > 2:  # Threshold of 2 standard deviations
-                        await self.trigger_alarm(
-                            device_id, obj_id, prop_id, "Anomaly", values[i], None, z_score=z, severity="minor"
-                        )
+        # Anomaly Detection (Using Z-Score)
+        if len(recent_values) >= 2:  # Ensure enough data for Z-score calculation
+            timestamps, values = zip(*recent_values)
+            z_scores = (np.array(values) - np.mean(values)) / np.std(values)
+            if any(abs(z) > 2 for z in z_scores):  # Check if any z-score is above threshold
+                await self.trigger_alarm(
+                    device_id,
+                    obj_id,
+                    prop_id,
+                    "Anomaly Detected", 
+                    values[-1],  # Latest anomalous value
+                    priority=None,
+                    z_score=z_scores[-1],  # Latest Z-score
+                    severity="minor",
+                )
 
 
     async def trigger_alarm(self, device_id, obj_id, prop_id, alarm_type, alarm_value, priority=None, z_score=None):
