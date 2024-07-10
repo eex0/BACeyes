@@ -514,14 +514,19 @@ class AlarmManager:
         self.load_silenced_alarms() 
                
     async def handle_cov_notification(self, property_identifier, property_value, subscription):
-        """Handles incoming COV notifications and triggers/clears alarms."""
+        """Handles incoming COV notifications and manages alarms."""
+
         obj_id = subscription.obj_id
         prop_id = subscription.prop_id
         device_id = subscription.device_id
 
+        # Get the most recent 10 values for trend analysis (if applicable)
+        history = self.app.cov_history.get(obj_id, {}).get(prop_id, [])
+        recent_values = history[-10:]  # Get the last 10 values, or fewer if not available
+
         # Change Filtering (if applicable)
         if subscription.change_filter:
-            previous_value = self.app.cov_history.get(obj_id, {}).get(prop_id, [])[-1][1] if self.app.cov_history.get(obj_id, {}).get(prop_id, []) else None
+            previous_value = recent_values[-1][1] if recent_values else None  # Get the last value from history
             if previous_value is not None and abs(property_value - previous_value) < subscription.change_filter:
                 return  # Skip if the change is below the filter threshold
 
@@ -530,7 +535,7 @@ class AlarmManager:
         if not self.is_alarm_silenced(alarm_key):
             await self.detect_alarm_flood(alarm_key)
 
-        if not self.is_alarm_flood_active():
+        if not self.is_alarm_flood_active(device_id):  # Check flood for the specific device
             # Alarm Logic (Only if not in alarm flood)
             for alarm in subscription.alarms:
                 alarm_type = alarm["type"]
@@ -538,21 +543,25 @@ class AlarmManager:
                 severity = alarm["severity"]
                 priority = alarm.get("priority")
 
-                if alarm_type == "high" and property_value > threshold:
-                    await self.trigger_alarm(device_id, obj_id, prop_id, f"High {property_identifier}", property_value, priority, severity=severity)
-                elif alarm_type == "low" and property_value < threshold:
-                    await self.trigger_alarm(device_id, obj_id, prop_id, f"Low {property_identifier}", property_value, priority, severity=severity)
-                elif alarm_type == "change" and property_value != previous_value:
-                    await self.trigger_alarm(device_id, obj_id, prop_id, f"Change of Value {property_identifier}", property_value, priority, severity=severity)
-                else:  # Check for alarm clearing conditions
-                    full_alarm_key = (device_id, obj_id, prop_id, alarm_type)
-                    if full_alarm_key in self.active_alarms:
-                        await self.clear_alarm(*full_alarm_key)
+                # Simplified Alarm Triggering and Clearing
+                full_alarm_key = (*alarm_key, alarm_type)
+                if self._should_trigger_alarm(alarm_type, property_value, threshold):
+                    await self.trigger_alarm(
+                        device_id,
+                        obj_id,
+                        prop_id,
+                        f"{alarm_type.capitalize()} {property_identifier}",
+                        property_value,
+                        priority,
+                        severity=severity,
+                        history=recent_values  # Pass recent values to trigger_alarm for trend analysis
+                    )
+                elif full_alarm_key in self.active_alarms:
+                    await self.clear_alarm(*full_alarm_key)
 
             # Anomaly Detection (Using Z-Score)
-            history = self.app.cov_history.get(obj_id, {}).get(prop_id, [])
-            if len(history) >= 2:
-                timestamps, values = zip(*history)
+            if len(recent_values) >= 2:
+                timestamps, values = zip(*recent_values)
                 z_scores = (np.array(values) - np.mean(values)) / np.std(values)
 
                 for i, z in enumerate(z_scores):
