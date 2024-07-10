@@ -143,6 +143,7 @@ class Subscription:
             )
             self.active = False  # Mark subscription as inactive on error
 
+
                     
 # ******************************************************************************
 
@@ -723,60 +724,42 @@ class AlarmManager:
                 _logger.error(f"Error acknowledging alarm in database: {e}")
 
     def save_cov_notification_to_db(self, device_id, obj_id, prop_id, value):
-        """Saves COV notification data to the SQLite database with error handling and type conversion."""
         try:
-            # Convert data types as needed
             device_id = int(device_id[1])  # Extract device instance from tuple
-            value = str(value)  # Convert value to string for flexibility
-
-            # Create the SQL query and data tuple
-            cursor = self.db_conn.cursor()
-            query = '''
-                INSERT INTO cov_notifications (timestamp, device_id, object_id, property_id, value)
-                VALUES (?, ?, ?, ?, ?)
-            '''
-            data = (
-                time.time(), device_id, str(obj_id), prop_id, value
+            cursor = self.app.db_conn.cursor()
+            cursor.execute(
+                "INSERT INTO cov_notifications (timestamp, device_id, object_id, property_id, value) VALUES (?, ?, ?, ?, ?)",
+                (time.time(), device_id, str(obj_id), prop_id, str(value)),  # Parameterized query
+            )
+            self.app.db_conn.commit()
+            _logger.debug(
+                f"COV notification saved to database: {obj_id}.{prop_id} = {value} (Device {device_id})"
             )
 
-            # Execute the query
-            cursor.execute(query, data)
-            self.db_conn.commit()
-            _logger.debug(f"COV notification saved to database: {obj_id}.{prop_id} = {value} (Device {device_id})")
-            
         except sqlite3.Error as e:
             _logger.error(f"Error saving COV notification to database: {e}")
-            self.db_conn.rollback()  # Rollback the transaction on error
+            self.app.db_conn.rollback()  # Rollback on error
             
-    def save_alarm_to_db(self, device_id, obj_id, prop_id, alarm_type, alarm_value, z_score, is_anomaly):
-        """Saves alarm data to the SQLite database with error handling and type conversion."""
-
+    def save_alarm_to_db(self, device_id, obj_id, prop_id, alarm_type, alarm_value, z_score=None, is_anomaly=False):
         try:
-            # Convert data types as needed
-            device_id = int(device_id[1])  # Extract device instance from tuple
+            device_id = int(device_id[1])
             z_score = float(z_score) if z_score is not None else None
             is_anomaly = int(is_anomaly)
 
-            # Create the SQL query and data tuple
-            cursor = self.db_conn.cursor()
-            query = '''
+            cursor = self.app.db_conn.cursor()
+            cursor.execute(
+                """
                 INSERT INTO alarms 
                 (timestamp, device_id, object_id, property_id, alarm_type, alarm_value, z_score, is_anomaly)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            '''
-            data = (
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # Format timestamp
-                device_id, str(obj_id), prop_id, alarm_type, str(alarm_value), z_score, is_anomaly
+                """,
+                (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), device_id, str(obj_id), prop_id, alarm_type, str(alarm_value), z_score, is_anomaly)  # Parameterized query
             )
-
-            # Execute the query
-            cursor.execute(query, data)
-            self.db_conn.commit()
+            self.app.db_conn.commit()
             _logger.debug(f"Alarm saved to database: {alarm_type} for {obj_id}.{prop_id} on device {device_id}")
-
         except sqlite3.Error as e:
             _logger.error(f"Error saving alarm to database: {e}")
-            self.db_conn.rollback()  # Rollback the transaction on error
+            self.app.db_conn.rollback()
 
     def load_silenced_alarms(self):
         """Loads silenced alarms from the database into memory."""
@@ -836,10 +819,12 @@ class AlarmManager:
             cursor = self.app.db_conn.cursor()
             cursor.execute(
                 "INSERT INTO silenced_alarms (device_id, object_id, property_id, alarm_type, silence_end_time) VALUES (?, ?, ?, ?, ?)",
-                (device_id, str(obj_id), prop_id, alarm_type, silence_end_time),
+                (device_id, str(obj_id), prop_id, alarm_type, silence_end_time),  # Parameterized query
             )
             self.app.db_conn.commit()
-            _logger.info(f"Alarm {alarm_key} silenced for {duration} seconds and stored in the database.")
+            _logger.info(
+                f"Alarm {alarm_key} silenced for {duration} seconds and stored in the database."
+            )
         except sqlite3.Error as e:
             _logger.error(f"Error silencing alarm in database: {e}")
             self.app.db_conn.rollback()
@@ -852,7 +837,10 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._log = ModuleLogger(globals())  # Use ModuleLogger
-        self.deviceInfoCache = DeviceInfoCache(self.this_device) 
+ 
+        self.registered_devices = {}
+        self.deviceInfoCache = DeviceInfoCache(self.this_device)
+        
         self.subscriptions = {}
         self.this_device = LocalDeviceObject(
             objectName=DEVICE_NAME, objectIdentifier=('device', DEVICE_ID)
@@ -887,7 +875,6 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
         self.alarm_manager = AlarmManager(self)
         self.trend_analyzer = TrendAnalyzer(self)
 
-        self.registered_devices = {} # Store registered devices and their properties
 
     def create_tables(self):
         """Creates the necessary tables in the database."""
@@ -901,7 +888,7 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
                 property_id TEXT, 
                 alarm_type TEXT,
                 alarm_value TEXT,
-                z_score REAL,  
+                z_score REAL, 
                 is_anomaly INTEGER DEFAULT 0, 
                 acknowledged INTEGER DEFAULT 0
             )
@@ -917,23 +904,6 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
             )
         ''')
         
-        # Trigger to delete old entries when 5 changes of a value have happened
-        cursor.execute("""
-            CREATE TRIGGER IF NOT EXISTS limit_cov_notifications AFTER INSERT ON cov_notifications
-            BEGIN
-                DELETE FROM cov_notifications
-                WHERE id IN (
-                    SELECT id
-                    FROM cov_notifications
-                    WHERE device_id = NEW.device_id
-                      AND object_id = NEW.object_id
-                      AND property_id = NEW.property_id
-                    ORDER BY timestamp DESC
-                    LIMIT -1 OFFSET 5  -- Keep only the latest 5 rows
-                );
-            END;
-        """) 
-               
         # Create the silenced_alarms table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS silenced_alarms (
@@ -944,7 +914,16 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
                 alarm_type TEXT,
                 silence_end_time REAL
             )
-        ''')        
+        ''')       
+        
+        # Add registered devices table if it doesn't exist
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS registered_devices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id INTEGER UNIQUE,
+                objects_properties TEXT
+            )
+        ''')
         self.db_conn.commit()
 
     async def start(self):
@@ -1054,6 +1033,13 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
     def validate_registration(self, registration_data, device_id):
         """Validates the registration data against both JSON and database, prioritizing the database."""
 
+        # 1. Validate Object and Property Identifiers
+        for obj_id, prop_ids in registration_data.get('objects_properties', {}).items():
+            obj_type, obj_instance = obj_id
+            if not self.validate_object_and_property((obj_type, obj_instance), prop_ids):
+                _logger.warning(f"Invalid object type, instance, or property in registration data for device {device_id}")
+                return False
+
         try:
             cursor = self.db_conn.cursor()
             cursor.execute(
@@ -1086,6 +1072,27 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
 
         # If both database and JSON checks fail, consider it invalid
         return False  
+
+    def validate_object_and_property(self, obj_id, prop_ids):
+        """Helper function to validate object type, instance, and properties."""
+        try:
+            obj_type, obj_instance = obj_id
+            # Ensure object type and instance are valid
+            obj_class = get_object_class(obj_type)
+            if not obj_class:
+                _logger.error(f"Unknown object type: {obj_type}")
+                return False
+
+            # Ensure all properties are valid for the object type
+            for prop_id in prop_ids:
+                if prop_id not in obj_class.properties:
+                    _logger.error(f"Unknown property: {prop_id} for object type: {obj_type}")
+                    return False
+
+            return True
+        except Exception as e:
+            _logger.error(f"Error validating object and property: {e}")
+            return False
 
     async def do_WhoIsRequest(self, apdu: WhoIsRequest) -> None:
         """Responds to Who-Is requests to announce the local device."""
@@ -1451,6 +1458,7 @@ class TrendAnalyzer:
         plt.show()
 
 # ******************************************************************************
+
 
 # Helper functions for CLI interactions
 
@@ -2008,7 +2016,7 @@ async def silence_alarm():
         return jsonify({"error": str(e)}), 400
 
 def start_api_server():
-    app_flask.run(host='0.0.0.0', port=5000)  # Start on all interfaces, port 5000
+    app_flask.run(host="0.0.0.0", port=5000)  # Start on all interfaces, port 5000
 
 # Main function
 async def main():
