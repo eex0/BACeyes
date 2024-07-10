@@ -684,7 +684,15 @@ class AlarmManager:
                 _logger.error(
                     f"Failed to send alarm notification email to {recipient_email}: {e}"
                 )
-                
+
+     def _get_notification_recipients(self, escalation_level):
+        """Determines notification recipients based on the escalation level."""
+        recipients = {
+            1: ["primary_contact@example.com"],
+            2: ["secondary_contact@example.com", "manager@example.com"],
+        }
+        return recipients.get(escalation_level, ["admin@example.com"])  # Default to admin for unknown levels
+   
     # In the trigger_alarm function
     # await self.send_alarm_notification(alarm_key)  # Initial notification (level 1)
 
