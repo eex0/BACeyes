@@ -318,6 +318,8 @@ class PropertyWriter:
 class BBMD:
     def __init__(self, address, topology_file="network_topology.json"):
         self.address = address
+        self.load_configuration()
+        self.db_file = db_file
         self.routing_table = {}
         self.topology_file = topology_file
         self.default_bbd_address = None
@@ -327,6 +329,57 @@ class BBMD:
         self.load_topology()
         self.topology_watcher = asyncio.create_task(self.watch_topology_file())
 
+    def load_configuration(self):
+        """Loads BBMD configuration from JSON file and database."""
+        try:
+            with open(self.topology_file, "r") as f:
+                topology_data = json.load(f)
+                bbmd_config = next(
+                    (bbmd for bbmd in topology_data.get("BBMDs", []) if bbmd.get("name") == bbmd_name),
+                    {}
+                )
+                self.broadcast_address = bbmd_config.get("broadcastAddress", "255.255.255.255")
+
+            # Load any additional information from database (if needed)
+            with sqlite3.connect(self.db_file) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT broadcast_address FROM bbmd_settings WHERE address = ?", (self.address,))
+                row = cursor.fetchone()
+                if row:
+                    self.broadcast_address = row[0]  # Override with value from database if found
+        
+        except (FileNotFoundError, json.JSONDecodeError, sqlite3.Error) as e:
+            _log.error(f"Error loading configuration: {e}")
+            self.broadcast_address = "255.255.255.255"  # Default to broadcast if there's an error
+
+    def update_configuration(self, new_broadcast_address):
+        """Updates the BBMD configuration in both JSON file and database."""
+        try:
+            # Update JSON file
+            with open(self.topology_file, "r+") as f:
+                topology_data = json.load(f)
+                for bbmd in topology_data.get("BBMDs", []):
+                    if bbmd.get("name") == bbmd_name:
+                        bbmd["broadcastAddress"] = new_broadcast_address
+                        break
+                f.seek(0)  # Rewind to the beginning of the file
+                json.dump(topology_data, f, indent=4)  # Overwrite with updated data
+                f.truncate()
+
+            # Update database
+            with sqlite3.connect(self.db_file) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE bbmd_settings SET broadcast_address = ? WHERE address = ?", 
+                    (new_broadcast_address, self.address)
+                )
+
+            self.broadcast_address = new_broadcast_address
+            _log.info(f"BBMD configuration updated: {self.address} - broadcastAddress: {new_broadcast_address}")
+
+        except (FileNotFoundError, json.JSONDecodeError, sqlite3.Error) as e:
+            _log.error(f"Error updating configuration: {e}")
+    
     async def discover_bbmds(self):
         """Discovers available BBMDs on the network."""
         bbmds = []
