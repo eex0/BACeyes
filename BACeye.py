@@ -2064,10 +2064,12 @@ def validate_database(db_path):
     except sqlite3.Error as e:
         logger.error(f"Database validation failed: {e}")
         return False
-
-
+        
+# Main function
 async def main():
 
+    # Validations **************************************************************
+    
     # Load configurations from environment variables or a file
     configurations = {
         "BBMD_ADDRESS": os.getenv("BBMD_ADDRESS"),
@@ -2098,23 +2100,38 @@ async def main():
     if not validate_database(db_path):
         logger.critical("Database validation failed. Exiting.")
         return
+        
+    # **************************************************************************
+        
+    # BACnet Application Setup (with timeouts)
+    timeout_seconds = 3  # Set your default timeout value here
+    try:
+        app = BACeeApp(LOCAL_ADDRESS, DEVICE_ID, DEVICE_NAME)
 
-    app = BACeeApp(LOCAL_ADDRESS, DEVICE_ID, DEVICE_NAME)
-    await app.start()
+        # Start BACnet application (potentially long-running)
+        bacnet_start_task = asyncio.create_task(app.start())
+        await asyncio.wait_for(bacnet_start_task, timeout=timeout_seconds)
 
-    # Register with the BBMD (if available)
-    if app.bbmd:
-        await app.bbmd.register_foreign_device()  # Remove the app argument
+        # Register with BBMD (if available)
+        if app.bbmd:
+            bbmd_register_task = asyncio.create_task(app.bbmd.register_foreign_device())
+            await asyncio.wait_for(bbmd_register_task, timeout=timeout_seconds)
 
-    # Start the subscription and alarm management tasks
-    asyncio.create_task(app.manage_subscriptions())
-    asyncio.create_task(app.manage_alarms())
+        # Start subscription and alarm management tasks (might run indefinitely)
+        subscription_task = asyncio.create_task(app.manage_subscriptions())
+        alarm_task = asyncio.create_task(app.manage_alarms())
+        cli_task = asyncio.create_task(cli_loop(app))
 
-    # Start the CLI loop
-    asyncio.create_task(cli_loop(app))
+        # Start API server (typically runs continuously)
+        api_server_task = asyncio.create_task(socketio.run(app_flask, host="0.0.0.0", port=5000))
 
-    # Start the API server with WebSocket
-    socketio.run(app_flask, host="0.0.0.0", port=5000)
-    
+        # Wait for any of these tasks to complete (e.g., due to error or shutdown)
+        await asyncio.wait([subscription_task, alarm_task, cli_task, api_server_task])
+
+    except asyncio.TimeoutError:
+        logger.error("Timeout occurred during BACnet operations.")
+        # Handle the timeout gracefully (e.g., clean up resources, log details)
+
+
 if __name__ == '__main__':
     asyncio.run(main())
