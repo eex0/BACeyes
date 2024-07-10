@@ -52,7 +52,6 @@ import jsonschema
 # ******************************************************************************
 
 # Logging Configuration (with Console and File Logging)
-_debug = 0
 _log = ModuleLogger(globals())  # Initialize the module logger
 logging.basicConfig(
     filename="bacee.log",
