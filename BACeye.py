@@ -164,7 +164,9 @@ class PropertyReader:
             return cached_value
 
         # Property not cached, read from device
-        request = ReadPropertyRequest(objectIdentifier=obj_id, propertyIdentifier=prop_id)
+        request = ReadPropertyRequest(
+            objectIdentifier=obj_id, propertyIdentifier=prop_id
+        )
         request.pduDestination = device_info.address
         try:
             response = await self.app.request(request)
@@ -174,7 +176,9 @@ class PropertyReader:
                 device_info.set_object_property(obj_id, prop_id, value)
                 return value
             else:
-                _logger.error(f"Error reading property {obj_id}.{prop_id} on device {device_id}: {response}")
+                _logger.error(
+                    f"Error reading property {obj_id}.{prop_id} on device {device_id}: {response}"
+                )
         except (CommunicationError, TimeoutError) as e:
             _logger.error(f"Communication error with device {device_id}: {e}")
         return None
@@ -197,8 +201,7 @@ class PropertyReader:
             read_access_specs.append((obj_id, prop_ids))
 
         request = ReadPropertyMultipleRequest(
-            device_address=device_info.address,
-            properties=read_access_specs
+            device_address=device_info.address, properties=read_access_specs
         )
 
         try:
@@ -207,10 +210,17 @@ class PropertyReader:
                 values = {}
                 for obj_prop_list in response.values:
                     for prop_value in obj_prop_list:
-                        values[(prop_value.objectIdentifier, prop_value.propertyIdentifier)] = prop_value.value
+                        values[
+                            (
+                                prop_value.objectIdentifier,
+                                prop_value.propertyIdentifier,
+                            )
+                        ] = prop_value.value
                 return values
             else:
-                _logger.error(f"Error reading multiple properties from device {device_id}: {response}")
+                _logger.error(
+                    f"Error reading multiple properties from device {device_id}: {response}"
+                )
         except (CommunicationError, TimeoutError) as e:
             _logger.error(f"Communication error with device {device_id}: {e}")
         return None
