@@ -1306,25 +1306,43 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
 
 
     async def discover_devices(self):
-        """Discovers all devices on the network. Uses BBMD if available, otherwise broadcasts locally."""
-        _logger.info("Discovering devices...")
+        """
+        Discovers BACnet devices on the network using either local broadcast or a BBMD.
+        """
+        device_info_cache = DeviceInfoCache(self.app.bacnet_stack)  # Use DeviceInfoCache
+        discovered_devices = []
+
+        def callback(address, device_id):
+            """
+            Callback function to handle discovered device information.
+            """
+            device_info_cache.update_device_info(device_id, address)
+            _log.info(f"Discovered device: {device_id} at {address}")
+            discovered_devices.append(
+                {"device_id": device_id, "address": address}
+            )
 
         try:
-            if self.bbmd and self.bbmd.is_available:
-                # Discover devices using BBMD's network
-                _logger.info("Discovering devices using BBMD")
-                for network_number in self.bbmd.routing_table:
-                    bbmd_address = self.bbmd.get_destination_address(network_number * 1000)  # Assuming device IDs start at 1 within the network
-                    await asyncio.wait_for(self.who_is(destination=Address(bbmd_address)), timeout=5)
+            for bbmd in self.app.bbmd_manager.bbmds.values():  # Iterate over BBMDs in the manager
+                if bbmd.is_available:  # Use the 'is_available' property to check BBMD status
+                    _log.info(f"Discovering devices using BBMD at {bbmd.address}")
+                    await self.app.bacnet_stack.who_is(
+                        remoteStation=bbmd.address
+                    )
+                    break  # Exit the loop after discovering devices through the first available BBMD
             else:
-                # Fall back to local broadcast if BBMD is not available
-                _logger.info("BBMD unavailable or not configured, using local broadcast")
-                await asyncio.wait_for(self.who_is(), timeout=5)
+                _log.info("Discovering devices using local broadcast")
+                await self.app.bacnet_stack.who_is()
 
-        except asyncio.TimeoutError:
-            _logger.warning("Device discovery timed out.")
-        except Exception as e:
-            _logger.error(f"Error during device discovery: {e}")
+            # Wait for a short period to allow responses to come in
+            await asyncio.sleep(2) 
+
+        except BACpypesError as e:
+            _log.error(f"Error during device discovery: {e}")
+
+        finally:
+            self.app.deviceInfoCache = device_info_cache  # Update the device info cache
+        return discovered_devices
 
     async def check_writable_properties(self, device_id, object_type, object_instance):
         """Checks writable properties using read_multiple_properties."""
