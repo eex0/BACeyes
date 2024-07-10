@@ -627,10 +627,17 @@ class AlarmManager:
 
     async def escalate_alarm(self, alarm_key):
         """Escalates an alarm if not acknowledged within the specified timeframe."""
-        await asyncio.sleep(900)  # Wait for 15 minutes (adjust as needed)
-        if alarm_key in self.active_alarms:  # Check if still active
-            # Escalate to secondary contact
-            await self.send_alarm_notification(alarm_key, escalation_level=2)
+        try:
+            await asyncio.sleep(900)  # Wait for 15 minutes
+
+            # Check if the alarm is still active and not acknowledged
+            if alarm_key in self.active_alarms and alarm_key not in self.acknowledged_alarms:
+                logger.info(f"Escalating alarm {alarm_key} to level 2")
+                await self.send_alarm_notification(alarm_key, escalation_level=2)
+            else:
+                logger.info(f"Alarm {alarm_key} already acknowledged or cleared. No escalation needed.")
+        except asyncio.CancelledError:
+            logger.info(f"Escalation task for alarm {alarm_key} cancelled.")
 
 
     async def send_alarm_notification(self, alarm_key, escalation_level=1):
