@@ -1361,7 +1361,7 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
             _logger.error(f"Error unsubscribing from COV: {e}")
             
     async def request_io(self, request, timeout=5, retries=3):
-        """Sends an IOCB request with timeout, retry logic."""
+
         if self.bbmd and not request.pduDestination.is_broadcast:
             request.pduDestination = self.bbmd.address  # Route through BBMD if available
             _logger.debug(f"Sending request via BBMD to {request.pduDestination}")
