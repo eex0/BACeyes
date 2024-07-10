@@ -92,21 +92,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# if you have many msgs use: only warnings, errors, and critical messages will appear in the console
-# console_handler = logging.StreamHandler(sys.stdout)
-# console_handler.setLevel(logging.WARNING)  # Only WARNING and above to console
-
-# logging.basicConfig(
-#     level=logging.INFO, 
-#     format="%(asctime)s - %(levelname)s - %(message)s",
-#     handlers=[
-#         logging.handlers.RotatingFileHandler(
-#             "bacee.log", maxBytes=1024 * 1024 * 5, backupCount=5
-#         ),
-#         console_handler
-#     ]
-# )
-
 # ******************************************************************************
 
 # --- Device & Network Configuration (from JSON) ---
