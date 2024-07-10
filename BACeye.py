@@ -80,16 +80,16 @@ from flask_socketio import disconnect
 
 # Logging Configuration (with Console and File Logging)
 logging.basicConfig(
+    filename="bacee.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.handlers.RotatingFileHandler(
             "bacee.log", maxBytes=1024 * 1024 * 5, backupCount=5
         ),
-        logging.StreamHandler(sys.stdout)  # Add console handler
-    ]
+        logging.StreamHandler(sys.stdout),  # Add console handler
+    ],
 )
-
 logger = logging.getLogger(__name__)
 
 # if you have many msgs use: only warnings, errors, and critical messages will appear in the console
