@@ -580,32 +580,49 @@ class AlarmManager:
                 )
 
 
-    async def trigger_alarm(self, device_id, obj_id, prop_id, alarm_type, alarm_value, priority=None, z_score=None):
+    async def trigger_alarm(self, device_id, obj_id, prop_id, alarm_type, alarm_value, priority=None, z_score=None, severity="medium", history=None):
+        """Triggers an alarm, stores it, and sends a notification."""
+
         alarm_key = (device_id, obj_id, prop_id, alarm_type)
-        if alarm_key not in self.active_alarms:
-            _logger.info(f"Triggering alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}: Value={alarm_value}, Z-score={z_score}")
+
+        # Check if the alarm is already active and of the same type
+        existing_alarm = self.active_alarms.get(alarm_key)
+        if existing_alarm:
+            # Check for severity upgrade or value change
+            if existing_alarm["severity"] != severity or existing_alarm["alarm_value"] != alarm_value:
+                logger.info(f"Updating active alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}: Value={alarm_value}, Z-score={z_score}, Severity={severity}")
+                existing_alarm.update({
+                    "timestamp": time.time(),
+                    "alarm_value": alarm_value,
+                    "z_score": z_score,
+                    "severity": severity,
+                })
+
+                # Save updated alarm to DB
+                self.app.save_alarm_to_db(*alarm_key, alarm_value, z_score, existing_alarm["is_anomaly"])
+            else:
+                logger.debug(f"Alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id} already active and unchanged.")
+                return  # No need to trigger again
+        else:
+            # Create and log a new alarm entry
+            logger.info(f"Triggering alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}: Value={alarm_value}, Z-score={z_score}")
 
             self.active_alarms[alarm_key] = {
-                'timestamp': time.time(),
-                'alarm_type': alarm_type,
-                'alarm_value': alarm_value,
-                'priority': priority,  # Store the priority
-                'z_score': z_score,    # Store the Z-score (if applicable)
-                'is_anomaly': alarm_type == "Anomaly",
+                "timestamp": time.time(),
+                "alarm_type": alarm_type,
+                "alarm_value": alarm_value,
+                "priority": priority,
+                "z_score": z_score,
+                "severity": severity,
+                "is_anomaly": alarm_type == "Anomaly",
             }
-            self.app.save_alarm_to_db(*alarm_key, alarm_value, z_score, self.active_alarms[alarm_key]['is_anomaly'])
-            
-            # Send alarm notification 
-            await self.send_alarm_notification(alarm_key)
-            
-            # Include severity in the alarm data
-            self.active_alarms[alarm_key]["severity"] = severity 
+            self.app.save_alarm_to_db(*alarm_key, alarm_value, z_score, self.active_alarms[alarm_key]["is_anomaly"])
 
-            # Send initial notification
-            await self.send_alarm_notification(alarm_key)
+        # Send notification (including potential trend information)
+        await self.send_alarm_notification(alarm_key, history=history)  
 
-            # Start escalation timer for critical alarms (if needed)
-            if severity == "critical":
+        # Escalation for new or upgraded critical alarms
+        if severity == "critical" and (existing_alarm is None or existing_alarm["severity"] != "critical"):
             asyncio.create_task(self.escalate_alarm(alarm_key))
 
     async def escalate_alarm(self, alarm_key):
