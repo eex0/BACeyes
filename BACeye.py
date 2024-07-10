@@ -60,8 +60,7 @@ from bacpypes3.debugging import ModuleLogger, bacpypes_debugging
 
 # ChangeOfValueServices
 from bacpypes3.service.cov import ChangeOfValueServices, SubscriptionContextManager
-_debug = 0
-_log = ModuleLogger(globals())
+
 #DeviceInfoCache
 from bacpypes3.netservice import NetworkServiceAccessPoint, NetworkServiceElement
 from bacpypes3.comm import bind
@@ -80,6 +79,7 @@ from flask_socketio import disconnect
 # ******************************************************************************
 
 # Logging Configuration (with Console and File Logging)
+_debug = 0
 _log = ModuleLogger(globals())  # Initialize the module logger
 logging.basicConfig(
     filename="bacee.log",
