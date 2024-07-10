@@ -996,6 +996,28 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
 
         _logger.debug("running")
 
+    async def shutdown(self):
+        """Gracefully shuts down the BACnet application."""
+        logger.info("Shutting down BACnet application...")
+
+        # Unsubscribe from all COVs
+        for subscription in self.subscriptions.keys():
+            await self.unsubscribe_cov(subscription.device_id, subscription.obj_id, subscription.prop_id)
+
+        # Cancel any pending tasks
+        for task in asyncio.all_tasks():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # Close the database connection
+        self.db_conn.close()
+        
+        # Stop the BACnet application
+        stop()
+          
     async def load_registered_devices(self):
         """Loads registered device information from the database."""
         try:
