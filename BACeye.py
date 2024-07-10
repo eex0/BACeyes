@@ -815,14 +815,26 @@ class AlarmManager:
     async def manage_alarms(self):
         """Periodically checks active alarms and sends reminders if they persist."""
         while True:
-            for alarm_key, alarm_data in list(self.active_alarms.items()):
-                if time.time() - alarm_data['timestamp'] > self.reminder_interval:
+            current_time = time.time()  # Get the current time once per loop
+            for alarm_key, alarm_data in list(self.active_alarms.items()):  
+                if current_time - alarm_data['timestamp'] > self.reminder_interval:
                     device_id, obj_id, prop_id, alarm_type = alarm_key
-                    _logger.warning(
+                    logger.warning(
                         f"Alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id} is still active. Sending reminder."
                     )
-                    # ... (Send reminder notification using your preferred method)
-            await asyncio.sleep(self.reminder_interval)  # Check every reminder_interval seconds
+
+                    # (Option 1) Send reminder directly
+                    await self.send_reminder_notification(alarm_key)  
+
+                    # (Option 2) Create a task for sending the reminder
+                    # asyncio.create_task(self.send_reminder_notification(alarm_key)) 
+            
+            await asyncio.sleep(self.reminder_interval)
+    
+    async def send_reminder_notification(self, alarm_key):
+        """Sends a reminder notification for the given alarm."""
+        device_id, obj_id, prop_id, alarm_type = alarm_key
+        # Implementation for sending the reminder notification
 
     async def acknowledge_alarm(self, alarm_key):
         """Acknowledges an alarm, moving it from active to acknowledged."""
