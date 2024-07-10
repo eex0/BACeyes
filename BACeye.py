@@ -388,43 +388,33 @@ class BBMD:
                 _logger.warning("Topology file not found. Will retry in 5 seconds.")
             await asyncio.sleep(5)  # Check for changes every 5 seconds
 
-    async def request_routing_table(self, app: "BACeeApp"):
-        """Requests the routing table from the BBMD and handles errors."""
-        _logger.info("Requesting routing table from BBMD")
-
-        # Create a ReadPropertyRequest directly
-        request = ReadPropertyRequest(
-            objectIdentifier=('device', 1),  # Typically the BBMD is device ID 1
-            propertyIdentifier='routingTable'
-        )
-
-        # Set the destination address to the BBMD's address
-        request.pduDestination = self.address
+    async def request_routing_table(self, destination_address):
+        """
+        Requests the routing table from the BBMD at the specified destination address.
+        """
 
         try:
-            # Send the request and wait for the response, with error handling and retries
-            response = await app.request(request)
- 
-            if not isinstance(response, ReadPropertyACK):
-                raise BACpypesError(f"Unexpected response type: {type(response)}")
+            # Create a request for the routing table
+            request = ReadPropertyRequest(
+                objectIdentifier=("device", self.device_id),
+                propertyIdentifier="routingTable",
+            )
+            request.pduDestination = Address(destination_address)
 
-            routing_table_data = response.propertyValue
-            if not isinstance(routing_table_data, ArrayOf):
-                raise BACpypesError("Routing table data is not an ArrayOf")
+            # Send the request and wait for the response
+            response = await self.app.bacnet_stack.request(request, timeout=5)
 
-            routing_table = []
-            for entry in routing_table_data:
-                if isinstance(entry, SequenceOf):
-                    try:
-                        network_number = entry[0].cast_out(Unsigned)
-                        bbd_address = entry[1]
-                        routing_table.append((network_number, bbd_address))
-                    except (DecodingError, IndexError) as e:
-                        _logger.warning(f"Error parsing routing table entry: {e}")
-                else:
-                    _logger.warning(f"Unexpected routing table entry type: {type(entry)}")
+            if isinstance(response, ReadPropertyACK):
+                # Extract routing table data
+                routing_table = response.propertyValue.cast_out(SequenceOf(SequenceOf(Unsigned)))
+                return routing_table
 
-            return routing_table
+        except (CommunicationError, TimeoutError) as e:
+            logger.error(f"Error requesting routing table: {e}")
+            return None
+
+        return None  # Return None if no routing table was received or in case of error
+
 
         except (CommunicationError, TimeoutError) as comm_err:
             _logger.error(f"Failed to communicate with BBMD: {comm_err}")
