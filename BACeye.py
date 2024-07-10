@@ -80,6 +80,7 @@ from flask_socketio import disconnect
 # ******************************************************************************
 
 # Logging Configuration (with Console and File Logging)
+_log = ModuleLogger(globals())  # Initialize the module logger
 logging.basicConfig(
     filename="bacee.log",
     level=logging.INFO,
