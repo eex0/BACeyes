@@ -785,27 +785,32 @@ class AlarmManager:
 
     async def clear_alarm(self, device_id, obj_id, prop_id, alarm_type):
         """Clears a previously triggered alarm."""
+
         alarm_key = (device_id, obj_id, prop_id, alarm_type)
+
+        # Remove from acknowledged alarms (if present)
         if alarm_key in self.acknowledged_alarms:
-            _logger.info(f"Clearing alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}")
+            _logger.info(f"Clearing acknowledged alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}")
             self.acknowledged_alarms.remove(alarm_key)
+        else:
+            # Check for alarm in active alarms
+            if alarm_key not in self.active_alarms:
+                logger.warning(f"Tried to clear a non-existent alarm: {alarm_key}")
+                return  # Exit early if alarm is not found
 
-        # Remove from active alarms as well (if present)
-        if alarm_key in self.active_alarms:
-            del self.active_alarms[alarm_key]
+        # Remove from active alarms
+        del self.active_alarms[alarm_key]
 
-        # Update the database to mark the alarm as cleared (if applicable)
+        # Update the database to mark the alarm as cleared
         try:
-            cursor = self.app.db_conn.cursor()
-            cursor.execute(
-                "UPDATE alarms SET acknowledged = 1, timestamp = ? WHERE device_id = ? AND object_id = ? AND property_id = ? AND alarm_type = ?",
-                (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), device_id[1], str(obj_id), prop_id, alarm_type)
-            )
-            self.app.db_conn.commit()
+            with self.app.db_conn:  # Use a context manager for automatic transaction handling
+                cursor = self.app.db_conn.cursor()
+                cursor.execute(
+                    "UPDATE alarms SET acknowledged = 1, timestamp = ? WHERE device_id = ? AND object_id = ? AND property_id = ? AND alarm_type = ?",
+                    (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), device_id[1], str(obj_id), prop_id, alarm_type)
+                )
         except sqlite3.Error as e:
-            _logger.error(f"Error clearing alarm in database: {e}")
-
-        # You can add your own custom alarm clearing logic here, such as sending a notification or updating a user interface.
+            logger.error(f"Error clearing alarm in database: {e}")
 
     async def manage_alarms(self):
         """Periodically checks active alarms and sends reminders if they persist."""
