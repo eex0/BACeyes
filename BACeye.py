@@ -1361,8 +1361,7 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
             _logger.error(f"Error unsubscribing from COV: {e}")
             
     async def request_io(self, request, timeout=5, retries=3):
-        """Sends a request to a BACnet device or BBMD, with timeout and retry logic."""
-
+        """Sends an IOCB request with timeout, retry logic."""
         if self.bbmd and not request.pduDestination.is_broadcast:
             request.pduDestination = self.bbmd.address  # Route through BBMD if available
             _logger.debug(f"Sending request via BBMD to {request.pduDestination}")
@@ -1391,12 +1390,13 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
                 _logger.error(f"Error sending request to {request.pduDestination}: {e}")
 
             # Exponential backoff for retries
-            await asyncio.sleep(2**attempt)
+            await asyncio.sleep(2 ** attempt)
 
         _logger.error(
             f"Request to {request.pduDestination} failed after {retries} retries."
         )
         return None  # Indicate failure after all retries
+
 
 
     def do_RouterAvailable(self, apdu):
