@@ -14,69 +14,39 @@
 import asyncio
 import json
 import logging
-import logging.handlers
 import os
 import time
-import re
-import sys
 import sqlite3
-from datetime import datetime
-from collections import defaultdict
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import numpy as np
-import matplotlib.pyplot as plt
-import threading
 
-from bacpypes3.app import BIPSimpleApplication
-from bacpypes3.constructeddata import ArrayOf, SequenceOf
-from bacpypes3.core import run, stop
-from bacpypes3.pdu import Address
-from bacpypes3.local.device import LocalDeviceObject
-from bacpypes3.object import get_object_class, get_datatype, PropertyIdentifier
-from bacpypes3.primitivedata import Unsigned
-from bacpypes3.apdu import (
-    Error,
-    IAmRequest,
+from bacpypes3 import (
+    acknowledge_alarm,
+    BIPSimpleApplication,
+    DeviceInfoCache,
+    DeviceObject,
+    EventHandler,
+    Null,
+    ObjectIdentifier,
+    Property,
     ReadPropertyACK,
+    ReadPropertyMultipleACK,
     ReadPropertyRequest,
-    RegisterForeignDeviceRequest,
-    SimpleAckPDU,
-    SubscribeCOVRequest,
-    UnsubscribeCOVRequest,
     WhoIsRequest,
     WritePropertyRequest,
-    ConfirmedCOVNotificationRequest,
-    PropertyValue,
-    ReadPropertyMultipleRequest,
-    WritePropertyMultipleRequest,
-    ReadPropertyMultipleACK,
 )
-from bacpypes3.primitivedata import Real, Unsigned
-from bacpypes3.errors import DecodingError, ExecutionError, BACpypesError
-from bacpypes3.local.object import AnalogInputObject
-from bacpypes3.settings import settings
-from bacpypes3.debugging import ModuleLogger, bacpypes_debugging
-
-# ChangeOfValueServices
-from bacpypes3.service.cov import ChangeOfValueServices, SubscriptionContextManager
-
-#DeviceInfoCache
-from bacpypes3.netservice import NetworkServiceAccessPoint, NetworkServiceElement
+from bacpypes3.apdu import ErrorRejectAbortNack
+from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.comm import bind
-from bacpypes3.ipv4.service import BIPForeign, UDPMultiplexer
-
-from jsonschema import validate
-
-from flask import Flask, jsonify, request
+from bacpypes3.constructeddata import ArrayOf, SequenceOf
+from bacpypes3.core import deferred, run
+from bacpypes3.debugging import ModuleLogger
+from bacpypes3.ipv4.app import NormalApplication
+from bacpypes3.local.device import LocalDeviceObject
+from bacpypes3.pdu import Address
+from bacpypes3.primitivedata import Unsigned
+from flask import Flask, request, jsonify
 from flask_httpauth import HTTPBasicAuth
-from flask_socketio import SocketIO, emit
-from itsdangerous import TimestampSigner
-import jwt  # Import PyJWT library for JWT handling
-from functools import wraps
-from flask import session, request, jsonify
-from flask_socketio import disconnect
+from jsonschema import validate
+import jsonschema
  
 
 # ******************************************************************************
@@ -452,25 +422,25 @@ class BBMD:
                 _logger.warning("Topology file not found. Will retry in 5 seconds.")
             await asyncio.sleep(5)  # Check for changes every 5 seconds
 
-    async def request_routing_table(self, destination_address):
+    async def request_routing_table(self):
         """
-        Requests the routing table from the BBMD at the specified destination address.
+        Requests the routing table from the BBMD.
         """
-        _log.debug(f"Requesting routing table from BBMD at {destination_address}")  # Add a debug log
+        _log.debug(f"Requesting routing table from BBMD at {self.address}")  
 
         try:
             # Create a request for the routing table
             request = ReadPropertyRequest(
-                objectIdentifier=('device', self.device_id),
+                objectIdentifier=('device', self.device_id),  
                 propertyIdentifier='routingTable'
             )
-            request.pduDestination = Address(destination_address)
+            request.pduDestination = Address(self.address)
 
             # Send the request and wait for the response
             try:
                 response = await self.app.bacnet_stack.request(request, timeout=5)
             except TimeoutError as e:
-                _log.error(f"Timeout error while requesting routing table: {e}")  # Log timeout error
+                _log.error(f"Timeout error while requesting routing table: {e}")
                 return None
 
             # Handle the response
@@ -484,12 +454,18 @@ class BBMD:
                     _log.error(f"Error extracting routing table data: {e}")
                     return None
             else:
-                _log.warning(f"Unexpected response type: {type(response)}")  # Log unexpected response
+                _log.warning(f"Unexpected response type: {type(response)}") 
                 return None
         except BACpypesError as e:
-            _log.error(f"BACpypes error requesting routing table: {e}")  # Log BACpypes error
+            _log.error(f"BACpypes error requesting routing table: {e}")  
             return None
 
+    def is_available(self):
+        """
+        Checks if the BBMD is available (registered and has a recent routing table).
+        """
+        return self.registered and self.routing_table is not None and \
+               (time.time() - self.last_update_time) < 60  # Update routing table every minute
 
     def get_destination_address(self, device_id):
         """Determines the destination address for a device ID, considering the routing table, 
@@ -511,24 +487,37 @@ class BBMD:
             _logger.warning("BBMD unavailable. Using local broadcast as a fallback.")
             return "255.255.255.255/24"  # Local broadcast address
 
-    async def register_foreign_device(self):
-        """Registers the local device as a foreign device with all discovered BBMDs."""
-        for bbmd in await self.discover_bbmds():
-            request = RegisterForeignDeviceRequest(
-                foreignDeviceAddress=self.app.localAddress,
-                ttl=Unsigned(300),  # 5-minute TTL
-            )
-            request.pduDestination = bbmd.address
-            try:
-                response = await self.app.request(request)
-                if isinstance(response, SimpleAckPDU):
-                    _logger.info(f"Successfully registered as a foreign device with BBMD at {bbmd.address}")
-                else:
-                    _logger.error(f"Failed to register as a foreign device with BBMD at {bbmd.address}: {response}")
-            except (CommunicationError, TimeoutError):
-                _logger.error(f"BBMD communication error during registration with {bbmd.address}")
+    async def register_foreign_device(self, ttl=600):
+        """Registers the local device as a foreign device with the BBMD."""
+        _log.debug(f"Registering as a foreign device with BBMD at {self.address}")
+        request = WritePropertyRequest(
+            objectIdentifier=("device", self.device_id),
+            propertyIdentifier="registerForeignDevice",
+            propertyValue=ArrayOf(Unsigned)([self.device_id, ttl]),
+        )
+        request.pduDestination = Address(self.address)
+        try:
+            response = await self.app.bacnet_stack.request(request, timeout=5)
+            _log.info(f"Registered as a foreign device with BBMD: {response}")
+            self.registered = True
+            self.routing_table = await self.request_routing_table()
+            self.last_update_time = time.time()
+        except (CommunicationError, TimeoutError) as e:
+            _log.error(f"Error registering as a foreign device: {e}")
 
+    def get_destination_address(self, device_id):
+        """Gets the destination address for a device, considering BBMD routing."""
 
+        # If BBMD is available and the device is not local, use the routing table
+        for bbmd in self.app.bbmd_manager.bbmds.values(): 
+            if bbmd.is_available() and device_id[0] != self.app.bacnet_stack.local_network:
+                for route in bbmd.routing_table:
+                    if isinstance(route, SequenceOf) and len(route) >= 2 and route[1].pduSource == Address(device_id):  
+                        return bbmd.address  # Route through the BBMD
+
+        # If no BBMD routing is needed (local device or no BBMD available), return the device's address directly
+        return Address(device_id)
+    
     async def update_routing_table(self, app: "BACeeApp"):
         """Requests and updates the BBMD's routing table."""
         _logger.info("Updating routing table from BBMD")
