@@ -2020,12 +2020,12 @@ def start_api_server():
 
 # Main function
 async def main():
-    app = BACeeApp(LOCAL_ADDRESS, DEVICE_ID, DEVICE_NAME)  # Remove BBMD_ADDRESS
+    app = BACeeApp(LOCAL_ADDRESS, DEVICE_ID, DEVICE_NAME)
     await app.start()
 
     # Register with the BBMD (if available)
     if app.bbmd:
-        await app.bbmd.register_foreign_device(app, ttl_seconds=300)  # Example TTL of 5 minutes
+        await app.bbmd.register_foreign_device()  # Remove the app argument
 
     # Start the subscription and alarm management tasks
     asyncio.create_task(app.manage_subscriptions())
@@ -2035,7 +2035,7 @@ async def main():
     asyncio.create_task(cli_loop(app))
 
     # Start the API server with WebSocket
-    socketio.run(app_flask, host='0.0.0.0', port=5000)
+    socketio.run(app_flask, host="0.0.0.0", port=5000)
 
 if __name__ == '__main__':
     asyncio.run(main())
