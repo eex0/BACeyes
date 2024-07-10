@@ -692,7 +692,35 @@ class AlarmManager:
             2: ["secondary_contact@example.com", "manager@example.com"],
         }
         return recipients.get(escalation_level, ["admin@example.com"])  # Default to admin for unknown levels
-   
+
+    def _format_alarm_message(self, alarm_data, device_info, history=None):
+        """Formats the alarm message content."""
+
+        # Ensure that alarm_data dictionary has necessary keys
+        try:
+            message_content = f"""
+            BACnet Alarm Notification
+
+            Severity: {alarm_data['severity']}
+            Alarm Type: {alarm_data['alarm_type']}
+            Device: {device_info.device_name} ({device_info.device_identifier[1]})
+            Object: {alarm_data['object_id']}
+            Property: {alarm_data['property_id']}
+            Value: {alarm_data['alarm_value']}
+            Timestamp: {datetime.fromtimestamp(alarm_data['timestamp']).strftime('%Y-%m-%d %H:%M:%S')}
+            Priority: {alarm_data.get('priority', 'Unknown')}
+            """
+        except KeyError as e:
+            logger.error(f"Error formatting alarm message: Missing key in alarm_data - {e}")
+            return "Error: Invalid alarm data"
+
+        if history and alarm_data.get('is_anomaly'):  # Safe access with .get()
+            # Add trend information to anomaly alarm message
+            trend_info = self._calculate_trend(history)
+            message_content += f"\nRecent Trend: {trend_info}"
+
+        return message_content
+        
     # In the trigger_alarm function
     # await self.send_alarm_notification(alarm_key)  # Initial notification (level 1)
 
