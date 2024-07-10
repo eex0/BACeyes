@@ -30,11 +30,12 @@ import matplotlib.pyplot as plt
 import threading
 
 from bacpypes3.app import BIPSimpleApplication
-from bacpypes3.constructeddata import ArrayOf
+from bacpypes3.constructeddata import ArrayOf, SequenceOf
 from bacpypes3.core import run, stop
 from bacpypes3.pdu import Address
 from bacpypes3.local.device import LocalDeviceObject
 from bacpypes3.object import get_object_class, get_datatype, PropertyIdentifier
+from bacpypes3.primitivedata import Unsigned
 from bacpypes3.apdu import (
     Error,
     IAmRequest,
