@@ -749,28 +749,39 @@ class AlarmManager:
     # In the escalate_alarm function
     # await self.send_alarm_notification(alarm_key, escalation_level=2)  # Escalation (level 2)
 
-    async def send_email_notification(self, message_content):
-        """Sends an email notification."""
-        recipient_email = 'your_email@example.com'  # Replace with the actual recipient email
-        sender_email = 'your_email@example.com'  # Replace with the actual sender email
-        password = 'your_email_password'  # Replace with your email password
+    async def send_email_notification(self, message_content, recipient_email):
+        """Sends an email notification using SMTP (e.g., Gmail)."""
+    
+        sender_email = os.environ.get("EMAIL_SENDER")  # Load from environment variable
+        password = os.environ.get("EMAIL_PASSWORD")  # Load from environment variable
+
+        if not sender_email or not password:
+            logger.error("Email credentials not found in environment variables. Cannot send notification.")
+            return  # Don't proceed if credentials are missing
 
         message = MIMEMultipart("alternative")
         message["Subject"] = "BACnet Alarm Notification"
         message["From"] = sender_email
         message["To"] = recipient_email
+    
+        # Include plain text and HTML versions of the message
+        text_part = MIMEText(message_content, "plain")
+        # Optionally, create an HTML version with better formatting
+        # html_part = MIMEText(f"<html><body>{message_content}</body></html>", "html") 
 
-        text = message_content
+        message.attach(text_part)
+        # message.attach(html_part) 
 
-        part1 = MIMEText(text, "plain")
-        message.attach(part1)
+        try:
+            # Use a context manager for automatic cleanup
+            async with AioSmtplib.SMTP_SSL("smtp.gmail.com", 465) as server:  # Or your SMTP server
+                await server.login(sender_email, password)
+                await server.send_message(message) 
+        
+            logger.info(f"Alarm notification email sent to {recipient_email}")
+         except Exception as e:
+            logger.error(f"Failed to send alarm notification email to {recipient_email}: {e}")
 
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(sender_email, password)
-            server.sendmail(
-                sender_email, recipient_email, message.as_string()
-            )
-            _logger.info(f"Alarm notification email sent to {recipient_email}")
 
     async def clear_alarm(self, device_id, obj_id, prop_id, alarm_type):
         """Clears a previously triggered alarm."""
