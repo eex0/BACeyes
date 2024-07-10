@@ -67,6 +67,8 @@ from bacpypes3.netservice import NetworkServiceAccessPoint, NetworkServiceElemen
 from bacpypes3.comm import bind
 from bacpypes3.ipv4.service import BIPForeign, UDPMultiplexer
 
+from jsonschema import validate
+
 from flask import Flask, jsonify, request
 from flask_httpauth import HTTPBasicAuth
 from flask_socketio import SocketIO, emit
@@ -110,6 +112,13 @@ BBMD_ADDRESS = local_device_config.get("bbmd_address", "192.168.1.255")
 
 # ******************************************************************************
 
+# TODO - Define custom exceptions for network communication and timeouts
+class CommunicationError(Exception):
+    pass
+
+class TimeoutError(Exception):
+    pass
+    
 # Subscription: deals with subscriptions to receive updates on specific properties
 
 class Subscription:
