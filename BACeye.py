@@ -143,43 +143,64 @@ class PropertyReader:
         self.app = app
 
     async def read_property(self, device_id, obj_id, prop_id):
-        """Reads a single property, caching the result in DeviceInfoCache."""
+        """Reads a single property from a BACnet device, utilizing the DeviceInfoCache.
+
+        Args:
+            device_id: The ID of the BACnet device.
+            obj_id: The object identifier (e.g., 'analogInput:1').
+            prop_id: The property identifier (e.g., 'presentValue').
+
+        Returns:
+            The property value if successful, or None if an error occurred or the device/property is not found.
+        """
+
         device_info = self.app.deviceInfoCache.get_device_info(device_id)
         if not device_info:
-            _logger.error(f"Device with ID {device_id} not found.")
+            _log.error(f"Device with ID {device_id} not found in cache.")
             return None
 
-        # Check if the property is already cached in DeviceInfoCache
+        # Check if the property is already cached
         cached_value = device_info.get_object_property(obj_id, prop_id)
         if cached_value is not None:
+            _log.debug(f"Property {obj_id}.{prop_id} found in cache for device {device_id}: {cached_value}")
             return cached_value
 
         # Property not cached, read from device
-        request = ReadPropertyRequest(
-            objectIdentifier=obj_id, propertyIdentifier=prop_id
-        )
+        _log.debug(f"Reading property {obj_id}.{prop_id} from device {device_id}")
+        request = ReadPropertyRequest(objectIdentifier=obj_id, propertyIdentifier=prop_id)
         request.pduDestination = device_info.address
+
         try:
-            response = await self.app.request(request)
+            response = await self.app.request(request)  # Assuming 'app' has a 'request' method
             if isinstance(response, ReadPropertyACK):
                 value = response.propertyValue
                 # Cache the value in DeviceInfoCache
                 device_info.set_object_property(obj_id, prop_id, value)
+                _log.debug(f"Read property {obj_id}.{prop_id} from device {device_id}: {value}")
                 return value
             else:
-                _logger.error(
-                    f"Error reading property {obj_id}.{prop_id} on device {device_id}: {response}"
-                )
+                _log.error(f"Error reading property {obj_id}.{prop_id} on device {device_id}: Unexpected response type {response}")
+        
         except (CommunicationError, TimeoutError) as e:
-            _logger.error(f"Communication error with device {device_id}: {e}")
-        return None
+            _log.error(f"Communication error reading property {obj_id}.{prop_id} from device {device_id}: {e}")
+
+        return None  # Return None on error or if property not found
 
     async def read_multiple_properties(self, device_id, obj_id_prop_id_list):
-        """Reads multiple properties from multiple objects on a device using RPM."""
+        """Reads multiple properties from multiple objects on a BACnet device using ReadPropertyMultiple.
+
+        Args:
+            device_id: The ID of the BACnet device.
+            obj_id_prop_id_list: A list of tuples, each containing an object ID and a property ID to read.
+
+        Returns:
+            A dictionary where keys are (object ID, property ID) tuples and values are the corresponding property values. 
+            Returns None if an error occurs or the device is not found.
+        """
 
         device_info = self.app.deviceInfoCache.get_device_info(device_id)
         if not device_info:
-            _logger.error(f"Device with ID {device_id} not found.")
+            _log.error(f"Device with ID {device_id} not found in cache.")
             return None
 
         # Group properties by object ID to create ReadAccessSpecification
@@ -196,25 +217,25 @@ class PropertyReader:
         )
 
         try:
-            response = await self.app.request(request)
+            response = await self.app.request(request)  # Assuming 'app' has a 'request' method
             if isinstance(response, ReadPropertyMultipleACK):
                 values = {}
                 for obj_prop_list in response.values:
                     for prop_value in obj_prop_list:
-                        values[
-                            (
-                                prop_value.objectIdentifier,
-                                prop_value.propertyIdentifier,
-                            )
-                        ] = prop_value.value
+                        values[(prop_value.objectIdentifier, prop_value.propertyIdentifier)] = prop_value.value
+
+                # Update the cache with the read values
+                device_info.update_properties(values)  # Update the cache
                 return values
+
             else:
-                _logger.error(
-                    f"Error reading multiple properties from device {device_id}: {response}"
-                )
+                _log.error(f"Error reading multiple properties from device {device_id}: Unexpected response type {response}")
+
         except (CommunicationError, TimeoutError) as e:
-            _logger.error(f"Communication error with device {device_id}: {e}")
-        return None
+            _log.error(f"Communication error with device {device_id}: {e}")
+            # You might want to handle the error more specifically, e.g., retry or raise a custom exception.
+
+        return None  # Return None on error or unexpected response
         
             
 # ******************************************************************************
