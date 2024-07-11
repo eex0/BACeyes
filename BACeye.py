@@ -3100,50 +3100,46 @@ def start_api_server():
         
 # Main function
 async def main():
-
+    """Main function to initialize, run, and gracefully shutdown the application."""
     _log.debug("Starting main application function...")
-    
-    # Validations **************************************************************
-    
-    # Load configurations from environment variables or a file
-    configurations = {
-        "BBMD_ADDRESS": os.getenv("BBMD_ADDRESS"),
-        "DEVICE_ID": os.getenv("DEVICE_ID"),
-        # ... other configurations
-    }
 
-    # Define validation rules 
-    validation_rules = {
-        "BBMD_ADDRESS": lambda value: value and ":" in value,
-        "DEVICE_ID": lambda value: value.isalnum(),
-        # ... other rules
-    }
+    # Load configuration from JSON file 
+    try:
+        with open("network_topology.json", "r") as f:
+            config = json.load(f)
+        local_device_config = config.get("local_device", {})
 
-    # Configuration Validation
+        # Update configurations with values from JSON
+        configurations = {
+            "BBMD_ADDRESS": local_device_config.get("bbmd_address"),
+            "DEVICE_ID": local_device_config.get("device_id"),
+            # ... other configurations
+        }
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        _log.error(f"Error loading network topology file: {e}")
+        return
+
+    # ... other validation logic
     if not validate_configurations(configurations, validation_rules):
-        logger.critical("Configuration validation failed. Exiting.")
-        return  # Exit early if configurations are invalid
+        _log.critical("Configuration validation failed. Exiting.")
+        return
 
-    # JSON and Database Validation
-    json_file_path = "config.json"
-    schema_file_path = "config_schema.json"
     if not validate_json_file(json_file_path, schema_file_path):
-        logger.critical("JSON validation failed. Exiting.")
+        _log.critical("JSON validation failed. Exiting.")
         return
 
     db_path = "mydb.db"
     if not validate_database(db_path):
-        logger.critical("Database validation failed. Exiting.")
+        _log.critical("Database validation failed. Exiting.")
         return
 
+    # ... other validation logic
     if not validate_configurations(configurations, validation_rules):
         _log.critical("Configuration validation failed. Exiting.")
-        return  
-        
-    # **************************************************************************
-        
-    # BACnet Application Setup (with enhanced async task handling)
-    tasks = set()  # Set to keep track of running tasks
+        return
+
+
+    # BACnet Application Setup
     try:
         _log.info("Starting BACnet application...")
         app = BACeeApp(LOCAL_ADDRESS, DEVICE_ID, DEVICE_NAME)
@@ -3183,7 +3179,6 @@ async def main():
                 pass  # Ignore CancelledError
     except Exception as e:  # Catch-all for unexpected errors
         _log.exception("An error occurred in the main function:", exc_info=e)
-
 
 if __name__ == '__main__':
     asyncio.run(main())
