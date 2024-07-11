@@ -32,6 +32,9 @@ from bacpypes3 import (
     ReadPropertyRequest,
     WhoIsRequest,
     WritePropertyRequest,
+    SubscribeCOVRequest,
+    ConfirmedCOVNotificationRequest,
+    UnconfirmedCOVNotificationRequest,
 )
 from bacpypes3.apdu import ErrorRejectAbortNack
 from bacpypes3.argparse import SimpleArgumentParser
