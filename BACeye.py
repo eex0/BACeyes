@@ -16,7 +16,6 @@ import sys
 import bacpypes3
 from bacpypes3.app import Application
 from bacpypes3.apdu import ErrorRejectAbortNack, SimpleAckPDU, ConfirmedCOVNotificationRequest, SimpleAckPDU, ReadPropertyRequest, WhoIsRequest, IAmRequest, SubscribeCOVRequest, UnconfirmedCOVNotificationRequest
-from bacpypes3.app import Application
 from bacpypes3.service.cov import Subscription
 from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.comm import bind
