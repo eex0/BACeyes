@@ -109,7 +109,7 @@ class Subscription:
     async def renew_subscription(self, app: BACeeApp, timeout: int = 5):
         """Renews the COV subscription, handling potential errors gracefully."""
 
-        subscription_info = f"{self.obj_id}.{self.prop_id}"  # For cleaner logging
+        subscription_info = f"{self.obj_id}.{self.prop_id}"  
 
         if not self.active:
             _log.warning(f"Attempting to renew inactive subscription: {subscription_info}")
@@ -117,22 +117,33 @@ class Subscription:
 
         _log.info(f"Renewing COV subscription: {subscription_info}")
 
-        try:
-            await asyncio.wait_for(app.subscribe_cov(self, renew=True), timeout=timeout)
-            _log.info(f"Successfully renewed subscription: {subscription_info}")
+        subscription_request = SubscribeCOVRequest(
+            subscriberProcessIdentifier=app.localDevice.objectIdentifier[1],  # Assumes local device object exists
+            monitoredObjectIdentifier=self.obj_id,
+            issueConfirmedNotifications=self.confirmed_notifications,
+            lifetimeInSeconds=self.lifetime_seconds,
+        )
+        if self.cov_increment is not None:
+            subscription_request.covIncrement = self.cov_increment
+        elif self.cov_increment_percentage is not None:
+            subscription_request.covIncrementPercentage = self.cov_increment_percentage
 
-        except asyncio.TimeoutError:
+        try:
+            response = await asyncio.wait_for(app.subscribe_cov(subscription_request, self), timeout=timeout)
+            if isinstance(response, SubscribeCOVRequest):  # Successful renewal returns original request
+                _log.info(f"Successfully renewed subscription: {subscription_info}")
+            else:
+                _log.error(f"Unexpected response received when trying to renew subscription: {subscription_info}")
+
+        except (Error, Reject, Abort) as e:  # Catch specific BACpypes3 errors
+            _log.error(f"Error renewing subscription: {subscription_info} - {e.errorClass} - {e.errorCode}")
+            self.active = False
+        except TimeoutError as e:
             _log.error(f"Timeout renewing subscription: {subscription_info} after {timeout} seconds")
             self.active = False
-
-        except CommunicationError as comm_err:
-            _log.error(f"Communication error renewing subscription: {subscription_info} - {comm_err}")
-            self.active = False  # Mark as inactive due to communication failure
-        
-        except Exception as e:  # Catch any unexpected errors
+        except Exception as e:  # Catch-all for unexpected errors
             _log.exception(f"Unexpected error renewing subscription: {subscription_info} - {e}")
             self.active = False 
-
 
                     
 # ******************************************************************************
