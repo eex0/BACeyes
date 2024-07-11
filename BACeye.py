@@ -83,12 +83,8 @@ class CommunicationError(Exception):
 class TimeoutError(Exception):
     pass
 
-                    
-
-            
 # ******************************************************************************
 
-    
 class BBMD:
     # __init__
     def __init__(self, address, db_file, topology_file="network_topology.json", bbmd_name=None):
@@ -357,8 +353,6 @@ async def request_routing_table(self):
 
     return None  # Indicate failure
 
-    
-    
     # is_available
     def is_available(self):
         """
@@ -400,7 +394,6 @@ async def request_routing_table(self):
                 _log.error(f"Failed to register as foreign device: {response}")
         except (CommunicationError, TimeoutError) as e:
             _log.error(f"Error registering as a foreign device: {e}")
-    
     
     # get_destination_address
     def get_destination_address(self, device_id):
@@ -518,7 +511,6 @@ async def validate_object_and_property(self, device_id, obj_id, prop_id):
                 except ValueError as e:
                     _log.error(f"Invalid subscription: {e}")
     
-               
 # ******************************************************************************
 
 # obsolete
@@ -1461,9 +1453,7 @@ class BACeeApp(Application):
                 _log.error(f"Error sending I-Am response: {e}")
         else:
             _log.debug(f"Local device ID {device_id} outside of requested range. Not responding.")
-    
-    
-    
+
     # discover_devices
     async def discover_devices(self):
         """Discovers BACnet devices on the network using either local broadcast or a BBMD."""
@@ -1915,7 +1905,6 @@ async def request_io(self, request, timeout=5, retries=3):
     return None  # Indicate failure after all retries
 
 
-
     # do_RouterAvailable
     def do_RouterAvailable(self, apdu):
         """Called when a router becomes available."""
@@ -2250,7 +2239,6 @@ class Subscription:
 
 # ******************************************************************************
 
-
 class TrendAnalyzer:
     def __init__(self, app: BACeeApp):
         self.app = app
@@ -2369,7 +2357,6 @@ async def handle_create_subscription(app):
         await app.subscribe_cov(subscription)
     except Exception as e:
         _log.error(f"Error creating subscription: {e}")
-
 
 # handle_unsubscribe
 async def handle_unsubscribe(app):
@@ -2517,9 +2504,7 @@ async def cli_loop(app):
             _log.warning("Invalid input. Please enter a number.")
 
 
-
 # ******************************************************************************
-
 
 # --- Flask ---
 
@@ -3025,7 +3010,6 @@ def silence_alarm():
     except (ValueError, KeyError, TypeError) as e:
         _log.error(f"Error silencing alarm: {e}")
         return jsonify({"error": str(e)}), 400
-
 
 
 # get_alarm_history
