@@ -3100,10 +3100,11 @@ def start_api_server():
         
 # Main function
 async def main():
-    """Main function to initialize, run, and gracefully shutdown the application."""
+    """Main function to initialize, run, and gracefully shutdown the BACnet application."""
+
     _log.debug("Starting main application function...")
 
-    # Load configuration from JSON file 
+    # Load configurations from JSON file
     try:
         with open("network_topology.json", "r") as f:
             config = json.load(f)
@@ -3112,50 +3113,60 @@ async def main():
         # Update configurations with values from JSON
         configurations = {
             "BBMD_ADDRESS": local_device_config.get("bbmd_address"),
-            "DEVICE_ID": local_device_config.get("device_id"),
-            # ... other configurations
+            "DEVICE_ID": local_device_config.get("device_id", 123),  # Default to 123 if not provided
+            "DEVICE_NAME": local_device_config.get("device_name", "MyDevice"),  # Default name
+            # Add other configurations here as needed
         }
+
+        # Extract variables from the configuration file
+        DEVICE_ID = int(configurations['DEVICE_ID'])
+        DEVICE_NAME = configurations['DEVICE_NAME']
+        LOCAL_ADDRESS = local_device_config.get('local_address', '192.168.1.100/24')
+        BROADCAST_ADDRESS = '255.255.255.255'
+
     except (FileNotFoundError, json.JSONDecodeError) as e:
         _log.error(f"Error loading network topology file: {e}")
         return
 
-    # ... other validation logic
+    # Define validation rules
+    validation_rules = {
+        "BBMD_ADDRESS": lambda value: value is not None and ":" in value,
+        "DEVICE_ID": lambda value: isinstance(value, int) and value > 0,
+        "DEVICE_NAME": lambda value: isinstance(value, str) and value.strip() != ""  # Ensure non-empty string
+    }
+
+    # Configuration Validation
     if not validate_configurations(configurations, validation_rules):
         _log.critical("Configuration validation failed. Exiting.")
-        return
+        return  # Exit early if configurations are invalid
 
+    # JSON and Database Validation
+    json_file_path = "network_topology.json"
+    schema_file_path = "config_schema.json"
     if not validate_json_file(json_file_path, schema_file_path):
         _log.critical("JSON validation failed. Exiting.")
         return
 
-    db_path = "mydb.db"
+    db_path = "bacee.db"  # Use the same database file as BACeeApp
     if not validate_database(db_path):
         _log.critical("Database validation failed. Exiting.")
         return
-
-    # ... other validation logic
-    if not validate_configurations(configurations, validation_rules):
-        _log.critical("Configuration validation failed. Exiting.")
-        return
-
 
     # BACnet Application Setup
     try:
         _log.info("Starting BACnet application...")
         app = BACeeApp(LOCAL_ADDRESS, DEVICE_ID, DEVICE_NAME)
 
-        # Create task for BACnet start and BBMD registration
-        bacnet_task = asyncio.create_task(app.start())  # Don't need the inner function here
-        tasks = {bacnet_task}  # Initialize tasks set
-
-        # Create other tasks (manage_subscriptions, manage_alarms, cli_loop)
-        tasks.update({
-            asyncio.create_task(coro)
-            for coro in [app.manage_subscriptions(), app.alarm_manager.manage_alarms(), cli_loop(app)]
-        })
+        # Task Management
+        tasks = {
+            asyncio.create_task(app.start()),
+            asyncio.create_task(app.manage_subscriptions()),
+            asyncio.create_task(app.alarm_manager.manage_alarms()),
+            asyncio.create_task(cli_loop(app)),
+        }
 
         # Start API server task
-        api_server_task = asyncio.create_task(start_api_server())  # Assuming start_api_server is defined
+        api_server_task = asyncio.create_task(start_api_server())
         tasks.add(api_server_task)
 
         # Wait for any task to complete
@@ -3179,6 +3190,7 @@ async def main():
                 pass  # Ignore CancelledError
     except Exception as e:  # Catch-all for unexpected errors
         _log.exception("An error occurred in the main function:", exc_info=e)
+
 
 if __name__ == '__main__':
     asyncio.run(main())
