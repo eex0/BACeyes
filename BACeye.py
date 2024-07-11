@@ -326,110 +326,168 @@ class PropertyWriter:
 
     
 class BBMD:
-    def __init__(self, address, topology_file="network_topology.json"):
-        self.address = address
-        self.load_configuration()
+    # __init__
+    def __init__(self, address, db_file, topology_file="network_topology.json", bbmd_name=None):
+        self.address = Address(address)
         self.db_file = db_file
         self.routing_table = {}
         self.topology_file = topology_file
         self.default_bbd_address = None
         self.app = None
-        self.is_available = True  # Flag to track BBMD availability
+        self.is_available = True  
         self.topology_data = None
+        self.bbmd_name = bbmd_name
+        self.load_configuration()
         self.load_topology()
         self.topology_watcher = asyncio.create_task(self.watch_topology_file())
 
+    # load_configuration
     def load_configuration(self):
         """Loads BBMD configuration from JSON file and database."""
         try:
             with open(self.topology_file, "r") as f:
                 topology_data = json.load(f)
                 bbmd_config = next(
-                    (bbmd for bbmd in topology_data.get("BBMDs", []) if bbmd.get("name") == bbmd_name),
-                    {}
+                    (
+                        bbmd
+                        for bbmd in topology_data.get("BBMDs", [])
+                        if bbmd.get("name") == self.bbmd_name
+                    ),
+                    {},
                 )
                 self.broadcast_address = bbmd_config.get("broadcastAddress", "255.255.255.255")
 
-            # Load any additional information from database (if needed)
             with sqlite3.connect(self.db_file) as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT broadcast_address FROM bbmd_settings WHERE address = ?", (self.address,))
+                cursor.execute(
+                    "SELECT broadcast_address FROM bbmd_settings WHERE address = ?",
+                    (str(self.address),),
+                )
                 row = cursor.fetchone()
                 if row:
-                    self.broadcast_address = row[0]  # Override with value from database if found
-        
+                    self.broadcast_address = row[0] 
+                    _log.info(
+                        f"BBMD configuration loaded from database: {self.address} - broadcastAddress: {self.broadcast_address}"
+                    )
+                else:
+                    _log.info(
+                        f"BBMD configuration loaded from JSON: {self.address} - broadcastAddress: {self.broadcast_address}"
+                    )
+
         except (FileNotFoundError, json.JSONDecodeError, sqlite3.Error) as e:
             _log.error(f"Error loading configuration: {e}")
-            self.broadcast_address = "255.255.255.255"  # Default to broadcast if there's an error
+            self.broadcast_address = "255.255.255.255"
 
+    # update_configuration
     def update_configuration(self, new_broadcast_address):
         """Updates the BBMD configuration in both JSON file and database."""
+
         try:
             # Update JSON file
             with open(self.topology_file, "r+") as f:
                 topology_data = json.load(f)
                 for bbmd in topology_data.get("BBMDs", []):
-                    if bbmd.get("name") == bbmd_name:
+                    if bbmd.get("name") == self.bbmd_name:
                         bbmd["broadcastAddress"] = new_broadcast_address
                         break
-                f.seek(0)  # Rewind to the beginning of the file
-                json.dump(topology_data, f, indent=4)  # Overwrite with updated data
+                f.seek(0)
+                json.dump(topology_data, f, indent=4)
                 f.truncate()
 
             # Update database
             with sqlite3.connect(self.db_file) as conn:
                 cursor = conn.cursor()
                 cursor.execute(
-                    "UPDATE bbmd_settings SET broadcast_address = ? WHERE address = ?", 
-                    (new_broadcast_address, self.address)
+                    "UPDATE bbmd_settings SET broadcast_address = ? WHERE address = ?",
+                    (new_broadcast_address, str(self.address)),  # Use str(self.address) for database compatibility
                 )
 
             self.broadcast_address = new_broadcast_address
-            _log.info(f"BBMD configuration updated: {self.address} - broadcastAddress: {new_broadcast_address}")
+            _log.info(
+                f"BBMD configuration updated: {self.address} - broadcastAddress: {new_broadcast_address}"
+            )
 
         except (FileNotFoundError, json.JSONDecodeError, sqlite3.Error) as e:
             _log.error(f"Error updating configuration: {e}")
-    
+
+    # discover_bbmds
     async def discover_bbmds(self):
         """Discovers available BBMDs on the network."""
-        bbmds = []
+        _log.debug("Initiating BBMD discovery process...")
+    
         try:
             who_is = WhoIsRequest()
-            who_is.pduDestination = Address(BROADCAST_ADDRESS)
+            who_is.pduDestination = Address(self.broadcast_address)  # Use configured broadcast address
             self.app.request(who_is)  # Broadcast WhoIs
-            # Use an asyncio.Event to wait for responses for a certain duration.
-            await asyncio.sleep(5)  # Wait for IAm responses (adjust as needed)
-
+    
+            await asyncio.sleep(5)  # Adjust wait time if necessary
+    
+            discovered_bbmds = []
             for device in self.app.deviceInfoCache.get_device_infos():
                 if device.isBBMD:
-                    _logger.debug(f"Found BBMD: {device.address}")
-                    bbmds.append(device)
+                    _log.info(f"Discovered BBMD: {device.address}")
+                    discovered_bbmds.append(device)
+            return discovered_bbmds
+    
         except (CommunicationError, TimeoutError) as e:
-            _logger.error(f"Error discovering BBMDs: {e}")
-        return bbmds
+            _log.error(f"Error discovering BBMDs: {e}")
+            return []  # Return an empty list to indicate no BBMDs found
+    
+        except Exception as e:  # Catch-all for unexpected errors
+            _log.exception(f"Unexpected error during BBMD discovery: {e}")
+            return []
         
-    async def select_bbmd(self, bbmds):
-        """Selects a BBMD for routing based on your preferred strategy."""
-        # Implement your selection logic here (e.g., round-robin, proximity, etc.)
+     async def select_bbmd(self, bbmds):
+        """Selects a BBMD for routing using a round-robin strategy."""
+        _log.debug(f"Selecting BBMD from {len(bbmds)} discovered BBMDs...")
+    
         if not bbmds:
+            _log.warning("No BBMDs available for selection.")
             return None
+        
+        # Round-robin selection
+        next_index = self.app.bbmd_round_robin_index
+        self.app.bbmd_round_robin_index = (next_index + 1) % len(bbmds)
+        selected_bbmd = bbmds[next_index]
+    
+        _log.info(f"Selected BBMD: {selected_bbmd.address}")
+        return selected_bbmd
 
-        return bbmds[0]  # Example: Select the first BBMD found
 
+    # load_topology
     def load_topology(self):
         """Loads network topology and BBMDs from JSON file."""
         try:
             with open(self.topology_file, "r") as f:
                 self.topology_data = json.load(f)
-
-            # Load BBMDs from JSON (assuming an array of addresses)
-            bbmd_addresses = self.topology_data.get("bbmds", [])
-            self.bbmds = [Address(addr) for addr in bbmd_addresses]
-        
-        except (FileNotFoundError, json.JSONDecodeError) as e:
-            _logger.error(f"Error loading network topology: {e}")
-
-
+                _log.info(f"Network topology loaded from {self.topology_file}")  # Log successful loading
+    
+            bbmd_addresses = [
+                Address(entry.get("address"))
+                for entry in self.topology_data.get("BBMDs", [])
+                if isinstance(entry.get("address"), str)
+            ]  # Filter out invalid addresses
+            self.bbmds = bbmd_addresses  # Store BACpypes3 Address objects
+    
+            # Load default BBD address
+            default_bbd_config = next(
+                (
+                    bbmd
+                    for bbmd in self.topology_data.get("BBMDs", [])
+                    if bbmd.get("isDefaultBBD", False)
+                ),
+                {},
+            )
+            self.default_bbd_address = default_bbd_config.get("address")
+    
+        except FileNotFoundError as e:
+            _log.warning(f"Topology file {self.topology_file} not found: {e}")  # Use warning instead of error
+        except json.JSONDecodeError as e:
+            _log.error(f"Error decoding topology file {self.topology_file}: {e}")
+        except Exception as e:  # Catch-all for unexpected errors
+            _log.exception(f"Unexpected error loading topology: {e}")
+    
+    # watch_topology_file
     async def watch_topology_file(self):
         """Asynchronously monitors the topology file for changes and reloads it."""
         last_modified = os.path.getmtime(self.topology_file)
@@ -437,149 +495,194 @@ class BBMD:
             try:
                 current_modified = os.path.getmtime(self.topology_file)
                 if current_modified > last_modified:
-                    _logger.info("Topology file changed, reloading...")
+                    _log.info("Topology file changed, reloading...")
                     self.load_topology()
                     last_modified = current_modified
-
-                # Check for new devices that need to be subscribed to
-                for sub_info in self.topology_data.get("subscriptions", []):
-                    device_id = sub_info["device_id"]
-                    obj_id = (sub_info["object_type"], sub_info["object_instance"])
-                    property_identifier = sub_info["property_identifier"]
-                    subscription_key = (device_id, obj_id, property_identifier)
-
-                    if device_id in self.app.discovered_devices and subscription_key not in self.app.subscriptions:
-                        try:
-                            self.validate_object_and_property(obj_id, property_identifier)
-                            subscription = Subscription(device_id, obj_id, property_identifier)
-                            subscription.alarms = sub_info.get("alarms", [])
-                            self.app.subscriptions[subscription_key] = subscription
-                            await self.app.subscribe_cov(subscription)
-                        except ValueError as e:
-                            _logger.error(f"Invalid subscription: {e}")
-
+    
+                    # Trigger actions for topology changes (e.g., updating subscriptions)
+                    await self.handle_topology_change()  # Call a separate method for handling changes
+    
+                # Check for new devices and subscriptions
+                await self.check_and_subscribe_new_devices()
+    
             except FileNotFoundError:
-                _logger.warning("Topology file not found. Will retry in 5 seconds.")
-            await asyncio.sleep(5)  # Check for changes every 5 seconds
+                _log.warning("Topology file not found. Will retry in 5 seconds.")
+            except Exception as e:  # Catch-all for unexpected errors
+                _log.exception(f"Unexpected error while watching topology file: {e}")
+    
+            await asyncio.sleep(5)  # Check every 5 seconds
 
+
+    # request_routing_table
     async def request_routing_table(self):
-        """
-        Requests the routing table from the BBMD.
-        """
-        _log.debug(f"Requesting routing table from BBMD at {self.address}")  
-
+        """Requests the routing table from the BBMD."""
+        _log.debug(f"Requesting routing table from BBMD at {self.address}")
+    
         try:
-            # Create a request for the routing table
             request = ReadPropertyRequest(
-                objectIdentifier=('device', self.device_id),  
+                objectIdentifier=('device', self.device_id),
                 propertyIdentifier='routingTable'
             )
-            request.pduDestination = Address(self.address)
-
-            # Send the request and wait for the response
-            try:
-                response = await self.app.bacnet_stack.request(request, timeout=5)
-            except TimeoutError as e:
-                _log.error(f"Timeout error while requesting routing table: {e}")
-                return None
-
-            # Handle the response
+            request.pduDestination = self.address
+    
+            response = await self.app.request(request)
+    
             if isinstance(response, ReadPropertyACK):
-                # Extract and return the routing table
                 try:
                     routing_table = response.propertyValue.cast_out(SequenceOf(SequenceOf(Unsigned)))
                     _log.debug(f"Received routing table: {routing_table}")
                     return routing_table
-                except Exception as e:  # Catch more specific exception if possible
+                except Exception as e:  
                     _log.error(f"Error extracting routing table data: {e}")
                     return None
             else:
-                _log.warning(f"Unexpected response type: {type(response)}") 
+                _log.error(f"Unexpected response when requesting routing table: {response}")
                 return None
-        except BACpypesError as e:
-            _log.error(f"BACpypes error requesting routing table: {e}")  
+    
+        except (CommunicationError, TimeoutError) as e:
+            _log.error(f"Error requesting routing table: {e}")
             return None
-
+    
+    
+    # is_available
     def is_available(self):
         """
         Checks if the BBMD is available (registered and has a recent routing table).
         """
+        try:
+            last_update_time = self.last_update_time
+        except AttributeError:
+            last_update_time = 0
+            
         return self.registered and self.routing_table is not None and \
-               (time.time() - self.last_update_time) < 60  # Update routing table every minute
-
-    def get_destination_address(self, device_id):
-        """Determines the destination address for a device ID, considering the routing table, 
-        default BBD, and BBMD availability.
-        """
-        device_network = device_id // 1000  # Assuming network number is the first 3 digits of the device ID
-        bbd_address = self.routing_table.get(device_network)  # Try to find a BBD for the device's network
-
-        if bbd_address:
-            _logger.debug(f"Using BBD address {bbd_address} for device {device_id}")
-            return bbd_address
-        elif self.default_bbd_address:
-            _logger.warning(f"No BBD found for device {device_id}, using default BBD {self.default_bbd_address}")
-            return self.default_bbd_address
-        elif self.is_available:  # If BBMD is available but no route found
-            _logger.warning(f"No BBD found for device {device_id}, using BBMD address {self.address}")
-            return self.address  # Use the BBMD's address as a fallback
-        else:
-            _logger.warning("BBMD unavailable. Using local broadcast as a fallback.")
-            return "255.255.255.255/24"  # Local broadcast address
-
+               (time.time() - last_update_time) < 60
+    
+    
+    # register_foreign_device
     async def register_foreign_device(self, ttl=600):
         """Registers the local device as a foreign device with the BBMD."""
         _log.debug(f"Registering as a foreign device with BBMD at {self.address}")
+    
+        if not self.app or not hasattr(self.app, 'localDevice') or not hasattr(self.app.localDevice, 'objectIdentifier'):
+            _log.error("Local device information not available for registration.")
+            return
+        
         request = WritePropertyRequest(
-            objectIdentifier=("device", self.device_id),
+            objectIdentifier=("device", self.app.localDevice.objectIdentifier[1]), # Assumes local device object exists
             propertyIdentifier="registerForeignDevice",
-            propertyValue=ArrayOf(Unsigned)([self.device_id, ttl]),
+            propertyValue=ArrayOf(Unsigned)([self.app.localDevice.objectIdentifier[1], ttl]),  # use the device id from localDevice
         )
-        request.pduDestination = Address(self.address)
+        request.pduDestination = self.address
+    
         try:
-            response = await self.app.bacnet_stack.request(request, timeout=5)
-            _log.info(f"Registered as a foreign device with BBMD: {response}")
-            self.registered = True
-            self.routing_table = await self.request_routing_table()
-            self.last_update_time = time.time()
+            response = await self.app.request(request)
+            if isinstance(response, SimpleAckPDU):
+                _log.info(f"Registered as a foreign device with BBMD: {response}")
+                self.registered = True
+                self.last_update_time = time.time()
+                self.routing_table = await self.request_routing_table()
+            else:
+                _log.error(f"Failed to register as foreign device: {response}")
         except (CommunicationError, TimeoutError) as e:
             _log.error(f"Error registering as a foreign device: {e}")
-
+    
+    
+    # get_destination_address
     def get_destination_address(self, device_id):
         """Gets the destination address for a device, considering BBMD routing."""
-
-        # If BBMD is available and the device is not local, use the routing table
-        for bbmd in self.app.bbmd_manager.bbmds.values(): 
-            if bbmd.is_available() and device_id[0] != self.app.bacnet_stack.local_network:
-                for route in bbmd.routing_table:
-                    if isinstance(route, SequenceOf) and len(route) >= 2 and route[1].pduSource == Address(device_id):  
-                        return bbmd.address  # Route through the BBMD
-
-        # If no BBMD routing is needed (local device or no BBMD available), return the device's address directly
-        return Address(device_id)
     
-    async def update_routing_table(self, app: "BACeeApp"):
+        _log.debug(f"Determining destination address for device {device_id}")
+    
+        # Check if the device is local
+        if device_id[0] == self.app.localDevice.objectIdentifier[0]:
+            _log.debug(f"Device {device_id} is on the local network.")
+            return Address(device_id)  # Device is local, no routing needed
+    
+        # Iterate over available BBMDs
+        for bbmd in self.app.bbmd_manager.bbmds.values():
+            if bbmd.is_available():
+                _log.debug(f"Checking BBMD {bbmd.address} for route...")
+                for route in bbmd.routing_table:
+                    if isinstance(route, SequenceOf) and len(route) >= 2 and route[1].pduSource == Address(device_id):
+                        _log.debug(f"Found route to {device_id} through BBMD {bbmd.address}")
+                        return bbmd.address  # Route through the BBMD
+    
+        _log.warning(f"No route found for device {device_id}. Using direct addressing.")
+        return Address(device_id)  # No suitable BBMD, use direct addressing
+    
+    # update_routing_table
+    async def update_routing_table(self):
         """Requests and updates the BBMD's routing table."""
-        _logger.info("Updating routing table from BBMD")
-
-        request = ReadPropertyRequest(
-            objectIdentifier=('device', 1),  
-            propertyIdentifier='routingTable'
+        _log.info("Updating routing table from BBMD")
+        new_routing_table = await self.request_routing_table()
+        if new_routing_table is not None:
+            self.routing_table = new_routing_table
+            self.last_update_time = time.time()
+            
+    # validate_object_and_property
+    def validate_object_and_property(self, obj_id, property_identifier):
+        """
+        Validates if the object and property exist on the device.
+        Raises ValueError if not valid.
+        """
+        # Implement object/property validation logic here
+        # You'll need to access the device's object list (possibly from self.app.deviceInfoCache)
+        # and check if the obj_id and property_identifier are valid for that object type
+        pass  # Placeholder - Replace with your validation logic
+    
+    # handle_topology_change (New method)
+    async def handle_topology_change(self):
+        """
+        Reacts to changes in the topology file.
+        """
+        _log.info("Handling topology change...")
+    
+        # 1. Update list of BBMDs
+        bbmd_addresses = [
+            Address(entry.get("address"))
+            for entry in self.topology_data.get("BBMDs", [])
+            if isinstance(entry.get("address"), str)
+        ]  # Filter out invalid addresses
+        self.bbmds = bbmd_addresses
+    
+        # 2. Update default BBD address
+        default_bbd_config = next(
+            (
+                bbmd
+                for bbmd in self.topology_data.get("BBMDs", [])
+                if bbmd.get("isDefaultBBD", False)
+            ),
+            {},
         )
-        request.pduDestination = self.address  # Set destination to BBMD address
-
-        try:
-            response = await app.request(request)
-            if not isinstance(response, ReadPropertyACK):
-                raise BACpypesError(f"Unexpected response type from BBMD: {type(response)}")
-
-            # ... (Rest of the table parsing and update logic remains the same)
-        
-        except (CommunicationError, TimeoutError) as comm_err:
-            _logger.error(f"Failed to communicate with BBMD: {comm_err}")
-            self.is_available = False  
-        except BACpypesError as e:
-            _logger.error(f"Error requesting or parsing routing table: {e}")
+        self.default_bbd_address = default_bbd_config.get("address")
+    
+        # 3. If this BBMD is the default, trigger network scan
+        if self.default_bbd_address == self.address:
+            asyncio.create_task(self.app.discover_devices())  # Trigger device discovery
+    
+        # 4. Update or create subscriptions based on the new topology (see previous response for example)
+    
+    # check_and_subscribe_new_devices (New method)
+    async def check_and_subscribe_new_devices(self):
+        """
+        Checks for new devices in the topology and subscribes to their properties.
+        """
+        for sub_info in self.topology_data.get("subscriptions", []):
+            device_id = sub_info["device_id"]
+            obj_id = (sub_info["object_type"], sub_info["object_instance"])
+            property_identifier = sub_info["property_identifier"]
+            subscription_key = (device_id, obj_id, property_identifier)
+    
+            if device_id in self.app.discovered_devices and subscription_key not in self.app.subscriptions:
+                try:
+                    self.validate_object_and_property(obj_id, property_identifier)
+                    subscription = Subscription(device_id, obj_id, property_identifier)
+                    subscription.alarms = sub_info.get("alarms", [])
+                    self.app.subscriptions[subscription_key] = subscription
+                    await self.app.subscribe_cov(subscription)
+                    _log.info(f"Subscribed to {obj_id}.{property_identifier} on device {device_id}")
+                except ValueError as e:
+                    _log.error(f"Invalid subscription: {e}")
 
 
 # ******************************************************************************
