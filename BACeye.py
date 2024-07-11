@@ -1,14 +1,9 @@
-# BACeyepys - uses:bacpypes3
-
-# Modular BACnet Communication for BBMD Devices: uses bacpypes
-
-# MIT License - 2024 by: eex0
-
 # Overall, this code serves as a robust foundation for building BACnet applications that require real-time monitoring 
 # and control of devices across potentially complex network topologies.
+
 # It can be customized and expanded to suit the specific requirements of various BACnet-based systems.
 
-# Notice: This is a work in progress, there ARE bugs here!
+# This is a work in progress, there ARE bugs here!
 
 import asyncio
 import json
@@ -16,39 +11,43 @@ import logging
 import os
 import time
 import sqlite3
+import sys
 
-from bacpypes3 import (
-    BIPSimpleApplication,
-    DeviceInfoCache,
-    DeviceObject,
-    ObjectIdentifier,
-    Property,
-    ReadPropertyACK,
-    ReadPropertyMultipleACK,
-    ReadPropertyRequest,
-    WhoIsRequest,
-    WritePropertyRequest,
-)
-from bacpypes3.apdu import Error, Reject, Abort
+import bacpypes3
+from bacpypes3.app import Application
+from bacpypes3.apdu import ErrorRejectAbortNack, SimpleAckPDU, ConfirmedCOVNotificationRequest, SimpleAckPDU, ReadPropertyRequest, WhoIsRequest, IAmRequest, SubscribeCOVRequest, UnconfirmedCOVNotificationRequest
+from bacpypes3.app import Application
+from bacpypes3.service.cov import Subscription
+from bacpypes3.argparse import SimpleArgumentParser
 from bacpypes3.comm import bind
 from bacpypes3.constructeddata import ArrayOf, SequenceOf
 from bacpypes3.debugging import ModuleLogger
 from bacpypes3.ipv4.app import NormalApplication
-from bacpypes3.local.device import LocalDeviceObject
-from bacpypes3.pdu import Address
+from bacpypes3.pdu import Address, LocalBroadcast
 from bacpypes3.primitivedata import Unsigned
+from bacpypes3.service.object import ReadWritePropertyServices
+
 from flask import Flask, request, jsonify
+from flask_socketio import SocketIO, emit, disconnect, join_room, leave_room
+from flask_httpauth import HTTPBasicAuth
 from jsonschema import validate
 import jsonschema
-
+from functools import wraps
+import jwt
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import defaultdict
+import aiosmtplib
+from datetime import datetime
 
 # ******************************************************************************
 
 
 # Logging Configuration (with Console and File Logging)
+_debug = 0
+# Logging Configuration (with Console and File Logging)
 _log = ModuleLogger(globals())  # Initialize the module logger
 logging.basicConfig(
-    filename="bacee.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
@@ -83,269 +82,9 @@ class CommunicationError(Exception):
 
 class TimeoutError(Exception):
     pass
-    
-# Subscription: deals with subscriptions to receive updates on specific properties
-
-class Subscription:
-    def __init__(self, device_id, obj_id, prop_id, confirmed_notifications=True, lifetime_seconds=None,
-        change_filter=None, priority=None,
-    ):
-        self.device_id = device_id
-        self.obj_id = obj_id
-        self.prop_id = prop_id
-        self.confirmed_notifications = confirmed_notifications
-        self.lifetime_seconds = lifetime_seconds
-        self.active = True
-        self.change_filter = change_filter
-        self.priority = priority
-        self.alarms = []
-        self.context_manager = None  # To store the SubscriptionContextManager
-
-
-    async def renew_subscription(self, app: BACeeApp, timeout: int = 5):
-        """Renews the COV subscription, handling potential errors gracefully."""
-
-        subscription_info = f"{self.obj_id}.{self.prop_id}"  
-
-        if not self.active:
-            _log.warning(f"Attempting to renew inactive subscription: {subscription_info}")
-            return
-
-        _log.info(f"Renewing COV subscription: {subscription_info}")
-
-        subscription_request = SubscribeCOVRequest(
-            subscriberProcessIdentifier=app.localDevice.objectIdentifier[1],  # Assumes local device object exists
-            monitoredObjectIdentifier=self.obj_id,
-            issueConfirmedNotifications=self.confirmed_notifications,
-            lifetimeInSeconds=self.lifetime_seconds,
-        )
-        if self.cov_increment is not None:
-            subscription_request.covIncrement = self.cov_increment
-        elif self.cov_increment_percentage is not None:
-            subscription_request.covIncrementPercentage = self.cov_increment_percentage
-
-        try:
-            response = await asyncio.wait_for(app.subscribe_cov(subscription_request, self), timeout=timeout)
-            if isinstance(response, SubscribeCOVRequest):  # Successful renewal returns original request
-                _log.info(f"Successfully renewed subscription: {subscription_info}")
-            else:
-                _log.error(f"Unexpected response received when trying to renew subscription: {subscription_info}")
-
-        except (Error, Reject, Abort) as e:  # Catch specific BACpypes3 errors
-            _log.error(f"Error renewing subscription: {subscription_info} - {e.errorClass} - {e.errorCode}")
-            self.active = False
-        except TimeoutError as e:
-            _log.error(f"Timeout renewing subscription: {subscription_info} after {timeout} seconds")
-            self.active = False
-        except Exception as e:  # Catch-all for unexpected errors
-            _log.exception(f"Unexpected error renewing subscription: {subscription_info} - {e}")
-            self.active = False 
-
 
                     
-# ******************************************************************************
 
-
-class PropertyReader:
-    def __init__(self, app: BACeeApp):
-        self.app = app
-
-    async def read_property(self, device_id, obj_id, prop_id):
-        """Reads a single property from a BACnet device, utilizing the DeviceInfoCache.
-
-        Args:
-            device_id: The ID of the BACnet device.
-            obj_id: The object identifier (e.g., 'analogInput:1').
-            prop_id: The property identifier (e.g., 'presentValue').
-
-        Returns:
-            The property value if successful, or None if an error occurred or the device/property is not found.
-        """
-
-        device_info = self.app.deviceInfoCache.get_device_info(device_id)
-        if not device_info:
-            _log.error(f"Device with ID {device_id} not found in cache.")
-            return None
-
-        # Check if the property is already cached
-        cached_value = device_info.get_object_property(obj_id, prop_id)
-        if cached_value is not None:
-            _log.debug(f"Property {obj_id}.{prop_id} found in cache for device {device_id}: {cached_value}")
-            return cached_value
-
-        # Property not cached, read from device
-        _log.debug(f"Reading property {obj_id}.{prop_id} from device {device_id}")
-        request = ReadPropertyRequest(objectIdentifier=obj_id, propertyIdentifier=prop_id)
-        request.pduDestination = device_info.address
-
-        try:
-            response = await self.app.request(request)  # Assuming 'app' has a 'request' method
-            if isinstance(response, ReadPropertyACK):
-                value = response.propertyValue
-                # Cache the value in DeviceInfoCache
-                device_info.set_object_property(obj_id, prop_id, value)
-                _log.debug(f"Read property {obj_id}.{prop_id} from device {device_id}: {value}")
-                return value
-            else:
-                _log.error(f"Error reading property {obj_id}.{prop_id} on device {device_id}: Unexpected response type {response}")
-        
-        except (CommunicationError, TimeoutError) as e:
-            _log.error(f"Communication error reading property {obj_id}.{prop_id} from device {device_id}: {e}")
-
-        return None  # Return None on error or if property not found
-
-    async def read_multiple_properties(self, device_id, obj_id_prop_id_list):
-        """Reads multiple properties from multiple objects on a BACnet device using ReadPropertyMultiple.
-
-        Args:
-            device_id: The ID of the BACnet device.
-            obj_id_prop_id_list: A list of tuples, each containing an object ID and a property ID to read.
-
-        Returns:
-            A dictionary where keys are (object ID, property ID) tuples and values are the corresponding property values. 
-            Returns None if an error occurs or the device is not found.
-        """
-
-        device_info = self.app.deviceInfoCache.get_device_info(device_id)
-        if not device_info:
-            _log.error(f"Device with ID {device_id} not found in cache.")
-            return None
-
-        # Group properties by object ID to create ReadAccessSpecification
-        object_property_map = defaultdict(list)
-        for obj_id, prop_id in obj_id_prop_id_list:
-            object_property_map[obj_id].append(prop_id)
-
-        read_access_specs = []
-        for obj_id, prop_ids in object_property_map.items():
-            read_access_specs.append((obj_id, prop_ids))
-
-        request = ReadPropertyMultipleRequest(
-            device_address=device_info.address, properties=read_access_specs
-        )
-
-        try:
-            response = await self.app.request(request)  # Assuming 'app' has a 'request' method
-            if isinstance(response, ReadPropertyMultipleACK):
-                values = {}
-                for obj_prop_list in response.values:
-                    for prop_value in obj_prop_list:
-                        values[(prop_value.objectIdentifier, prop_value.propertyIdentifier)] = prop_value.value
-
-                # Update the cache with the read values
-                device_info.update_properties(values)  # Update the cache
-                return values
-
-            else:
-                _log.error(f"Error reading multiple properties from device {device_id}: Unexpected response type {response}")
-
-        except (CommunicationError, TimeoutError) as e:
-            _log.error(f"Communication error with device {device_id}: {e}")
-            # You might want to handle the error more specifically, e.g., retry or raise a custom exception.
-
-        return None  # Return None on error or unexpected response
-
-        
-            
-# ******************************************************************************
-
-
-class PropertyWriter(BIPSimpleApplication, WritePropertyService):  # Inherit from BIPSimpleApplication and WritePropertyService
-    def __init__(self, *args, **kwargs):
-        BIPSimpleApplication.__init__(self, *args, **kwargs)
-
-    async def write_property(self, device_id, obj_id, prop_id, value, priority=None):
-        """Writes a value to a BACnet property using BACpypes3's built-in WritePropertyService."""
-        try:
-            device_info = self.app.deviceInfoCache.get_device_info(device_id)
-            if not device_info:
-                _log.error(f"Device with ID {device_id} not found. Cannot write property.")
-                return
-
-            # Convert value to appropriate BACnet type if needed (same logic as before)
-
-            request = WritePropertyRequest(
-                objectIdentifier=obj_id,
-                propertyIdentifier=prop_id,
-                propertyArrayIndex=None,
-                propertyValue=value,
-                priority=priority,
-            )
-
-            request.pduDestination = device_info.address
-            response = await self.request(request)  # Use BIPSimpleApplication's request method
-
-            if response.errorClass is None and response.errorCode is None:
-                _log.info(f"Successfully wrote {value} to {obj_id}.{prop_id}")
-                device_info.set_object_property(obj_id, prop_id, value)
-            else:
-                error_class = response.errorClass or "UnknownError"
-                error_code = response.errorCode or "UnknownCode"
-                _log.error(f"Failed to write {value} to {obj_id}.{prop_id}: {error_class} - {error_code}")
-        except Exception as e:
-            _log.exception(f"Error writing {value} to {obj_id}.{prop_id}: {e}")
-
-
-    async def write_multiple_properties(self, device_id, obj_id, prop_values, priority=None):
-        """Writes multiple properties to a BACnet object using BACpypes3's WritePropertyMultipleService.
-
-        Args:
-            device_id: The ID of the BACnet device.
-            obj_id: The object identifier (e.g., 'analogValue:1').
-            prop_values: A dictionary where keys are property identifiers and values are the values to write.
-            priority: (Optional) The priority of the write.
-
-        Returns:
-            None
-        """
-        device_info = self.app.deviceInfoCache.get_device_info(device_id)
-        if not device_info:
-            _log.error(f"Device with ID {device_id} not found. Cannot write properties.")
-            return
-
-        # Validate property values if necessary
-        for prop_id, value in prop_values.items():
-            if not self.validate_property_value(obj_id, prop_id, value):
-                _log.error(f"Invalid value {value} for property {prop_id} of object {obj_id}")
-                return 
-
-        write_access_spec_list = []
-        for prop_id, value in prop_values.items():
-            prop_data_type = get_datatype(obj_id[0], prop_id)
-            if isinstance(value, list):  # Handle list values as ArrayOf
-                value = ArrayOf(prop_data_type, value)
-            else:
-                value = prop_data_type(value)  # Convert individual values to BACnet type
-            write_access_spec_list.append(
-                WritePropertyMultipleResult(
-                    propertyIdentifier=prop_id,
-                    propertyValue=value,
-                    priority=priority,
-                )
-            )
-
-        request = WritePropertyMultipleRequest(
-            objectIdentifier=obj_id,
-            listOfWriteAccessSpecs=[write_access_spec_list]  # List of lists for multiple properties
-        )
-        request.pduDestination = device_info.address
-        try:
-            response = await self.multiple_write_property_request(request)  # Use WritePropertyMultipleService's request method
-
-            for result in response:
-                if result.propertyAccessError is not None:  # Check for errors in the result
-                    error_class = result.propertyAccessError.errorClass or "UnknownError"
-                    error_code = result.propertyAccessError.errorCode or "UnknownCode"
-                    _log.error(
-                        f"Error writing property {prop_id} of object {obj_id}: {error_class} - {error_code}"
-                    )
-                else:
-                    _log.info(f"Successfully wrote to property {prop_id} of object {obj_id}")
-                    device_info.set_object_property(obj_id, prop_id, prop_values[prop_id])  # Update the cache
-
-        except Exception as e:
-            _log.exception(f"Error writing multiple properties to {obj_id} on {device_id}: {e}")
-            return            
             
 # ******************************************************************************
 
@@ -367,46 +106,59 @@ class BBMD:
         self.topology_watcher = asyncio.create_task(self.watch_topology_file())
 
     # load_configuration
-    def load_configuration(self):
-        """Loads BBMD configuration from JSON file and database."""
-        try:
-            with open(self.topology_file, "r") as f:
-                topology_data = json.load(f)
-                bbmd_config = next(
-                    (
-                        bbmd
-                        for bbmd in topology_data.get("BBMDs", [])
-                        if bbmd.get("name") == self.bbmd_name
-                    ),
-                    {},
-                )
-                self.broadcast_address = bbmd_config.get("broadcastAddress", "255.255.255.255")
+def load_configuration(self):
+    """Loads BBMD configuration from JSON file and database."""
+    _log.debug("Loading BBMD configuration...")
 
-            with sqlite3.connect(self.db_file) as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT broadcast_address FROM bbmd_settings WHERE address = ?",
-                    (str(self.address),),
-                )
-                row = cursor.fetchone()
-                if row:
-                    self.broadcast_address = row[0] 
-                    _log.info(
-                        f"BBMD configuration loaded from database: {self.address} - broadcastAddress: {self.broadcast_address}"
-                    )
-                else:
-                    _log.info(
-                        f"BBMD configuration loaded from JSON: {self.address} - broadcastAddress: {self.broadcast_address}"
-                    )
+    try:
+        with open(self.topology_file, "r") as f:
+            topology_data = json.load(f)
+            bbmd_config = next(
+                (
+                    bbmd
+                    for bbmd in topology_data.get("BBMDs", [])
+                    if bbmd.get("name") == self.bbmd_name
+                ),
+                {},
+            )
+            self.broadcast_address = bbmd_config.get(
+                "broadcastAddress", "255.255.255.255"
+            )
 
-        except (FileNotFoundError, json.JSONDecodeError, sqlite3.Error) as e:
-            _log.error(f"Error loading configuration: {e}")
-            self.broadcast_address = "255.255.255.255"
+        with sqlite3.connect(self.db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT broadcast_address FROM bbmd_settings WHERE address = ?",
+                (str(self.address),),
+            )
+            row = cursor.fetchone()
+            if row:
+                self.broadcast_address = row[0]
+                _log.info(
+                    f"BBMD configuration loaded from database: {self.address} - broadcastAddress: {self.broadcast_address}"
+                )
+            else:
+                _log.info(
+                    f"BBMD configuration loaded from JSON: {self.address} - broadcastAddress: {self.broadcast_address}"
+                )
+
+    except FileNotFoundError as e:
+        _log.warning(f"Topology file {self.topology_file} not found: {e}")
+    except json.JSONDecodeError as e:
+        _log.error(f"Error decoding topology file {self.topology_file}: {e}")
+    except sqlite3.Error as e:
+        _log.error(f"Database error while loading configuration: {e}")
+    except Exception as e:  # Catch-all for unexpected errors
+        _log.exception(f"Unexpected error loading BBMD configuration: {e}")
+        self.broadcast_address = "255.255.255.255"  # Default to broadcast in case of error
+
 
     # update_configuration
     def update_configuration(self, new_broadcast_address):
         """Updates the BBMD configuration in both JSON file and database."""
-
+        _log.debug(
+            f"Updating BBMD configuration for {self.address} with broadcastAddress: {new_broadcast_address}"
+        )
         try:
             # Update JSON file
             with open(self.topology_file, "r+") as f:
@@ -432,8 +184,14 @@ class BBMD:
                 f"BBMD configuration updated: {self.address} - broadcastAddress: {new_broadcast_address}"
             )
 
-        except (FileNotFoundError, json.JSONDecodeError, sqlite3.Error) as e:
-            _log.error(f"Error updating configuration: {e}")
+        except FileNotFoundError as e:
+            _log.error(f"Topology file not found while updating configuration: {e}")
+        except json.JSONDecodeError as e:
+            _log.error(f"Error decoding topology file while updating configuration: {e}")
+        except sqlite3.Error as e:
+            _log.error(f"Database error while updating configuration: {e}")
+        except Exception as e:  # Catch-all for unexpected errors
+            _log.exception(f"Unexpected error updating BBMD configuration: {e}")
 
     # discover_bbmds
     async def discover_bbmds(self):
@@ -480,93 +238,125 @@ class BBMD:
 
 
     # load_topology
-    def load_topology(self):
-        """Loads network topology and BBMDs from JSON file."""
+def load_topology(self):
+    """Loads network topology and BBMDs from JSON file."""
+    retries = 2
+    while retries >= 0:
         try:
             with open(self.topology_file, "r") as f:
                 self.topology_data = json.load(f)
-                _log.info(f"Network topology loaded from {self.topology_file}")  # Log successful loading
-    
-            bbmd_addresses = [
-                Address(entry.get("address"))
-                for entry in self.topology_data.get("BBMDs", [])
-                if isinstance(entry.get("address"), str)
-            ]  # Filter out invalid addresses
-            self.bbmds = bbmd_addresses  # Store BACpypes3 Address objects
-    
-            # Load default BBD address
-            default_bbd_config = next(
-                (
-                    bbmd
-                    for bbmd in self.topology_data.get("BBMDs", [])
-                    if bbmd.get("isDefaultBBD", False)
-                ),
-                {},
-            )
-            self.default_bbd_address = default_bbd_config.get("address")
-    
+                _log.info(f"Network topology loaded from {self.topology_file}")  
+                break  # exit the loop if the file is read successfully.
         except FileNotFoundError as e:
-            _log.warning(f"Topology file {self.topology_file} not found: {e}")  # Use warning instead of error
-        except json.JSONDecodeError as e:
-            _log.error(f"Error decoding topology file {self.topology_file}: {e}")
+            retries -= 1
+            if retries >= 0:  # if there are retries left
+                _log.warning(f"Topology file {self.topology_file} not found: {e}. Retrying in 3 seconds...")
+                time.sleep(3)  # Wait 3 seconds before retrying
+            else:
+                _log.error(f"Topology file {self.topology_file} not found after multiple retries. Using default values.")
+                self.topology_data = {}  # Use an empty dictionary as default
+                break  # Exit the loop after all retries failed
+        except json.decoder.JSONDecodeError as e:
+            _log.error(f"Error decoding topology file {self.topology_file}: {e}. Using default values.")
+            self.topology_data = {}
+            break  # Exit the loop, decoding will not work on subsequent retries.
+        except KeyError as e:
+            _log.error(f"Missing key in topology file {self.topology_file}: {e}. Using default values.")
+            self.topology_data = {}
+            break  # Exit the loop, as the file format is wrong
         except Exception as e:  # Catch-all for unexpected errors
             _log.exception(f"Unexpected error loading topology: {e}")
+            self.topology_data = {}
+            break  # Exit the loop on any other exception
     
+
+    bbmd_addresses = [
+        Address(entry.get("address"))
+        for entry in self.topology_data.get("BBMDs", [])
+        if isinstance(entry.get("address"), str)
+    ] 
+    self.bbmds = bbmd_addresses  # Store BACpypes3 Address objects
+
+    # Load default BBD address
+    default_bbd_config = next(
+        (
+            bbmd
+            for bbmd in self.topology_data.get("BBMDs", [])
+            if bbmd.get("isDefaultBBD", False)
+        ),
+        {},
+    )
+    self.default_bbd_address = default_bbd_config.get("address")
+
+            
     # watch_topology_file
-    async def watch_topology_file(self):
-        """Asynchronously monitors the topology file for changes and reloads it."""
-        last_modified = os.path.getmtime(self.topology_file)
-        while True:
-            try:
-                current_modified = os.path.getmtime(self.topology_file)
-                if current_modified > last_modified:
-                    _log.info("Topology file changed, reloading...")
-                    self.load_topology()
-                    last_modified = current_modified
-    
-                    # Trigger actions for topology changes (e.g., updating subscriptions)
-                    await self.handle_topology_change()  # Call a separate method for handling changes
-    
-                # Check for new devices and subscriptions
-                await self.check_and_subscribe_new_devices()
-    
-            except FileNotFoundError:
-                _log.warning("Topology file not found. Will retry in 5 seconds.")
-            except Exception as e:  # Catch-all for unexpected errors
-                _log.exception(f"Unexpected error while watching topology file: {e}")
-    
-            await asyncio.sleep(5)  # Check every 5 seconds
+async def watch_topology_file(self):
+    """Asynchronously monitors the topology file for changes and reloads it."""
+    last_modified = 0
+    retries = 0
+    max_retries = 3
+    while True:
+        try:
+            current_modified = os.path.getmtime(self.topology_file)
+            if current_modified > last_modified:
+                _log.info("Topology file changed, reloading...")
+                self.load_topology()  # Reload topology
+                last_modified = current_modified
+
+                # Trigger actions for topology changes (e.g., updating subscriptions)
+                await self.handle_topology_change()  
+
+            retries = 0 # Reset retries on success
+            await self.check_and_subscribe_new_devices()
+
+        except FileNotFoundError as e:
+            if retries < max_retries:
+                retries += 1
+                _log.warning(f"Topology file not found. Attempt {retries}/{max_retries}. Retrying in 3 seconds...")
+                await asyncio.sleep(3)  # Retry after 3 seconds
+            else:
+                _log.error(f"Topology file not found after {max_retries} retries. Stopping topology watcher.")
+                return
+        except Exception as e:  # Catch-all for unexpected errors
+            _log.exception(f"Unexpected error while watching topology file: {e}")
+            # You might want to add a delay here before the next loop iteration
+        
+        await asyncio.sleep(5)  # Check every 5 seconds
 
 
     # request_routing_table
-    async def request_routing_table(self):
-        """Requests the routing table from the BBMD."""
-        _log.debug(f"Requesting routing table from BBMD at {self.address}")
+async def request_routing_table(self):
+    """Requests the routing table from the BBMD."""
+    _log.debug(f"Requesting routing table from BBMD at {self.address}")
     
-        try:
-            request = ReadPropertyRequest(
-                objectIdentifier=('device', self.device_id),
-                propertyIdentifier='routingTable'
-            )
-            request.pduDestination = self.address
-    
-            response = await self.app.request(request)
-    
-            if isinstance(response, ReadPropertyACK):
-                try:
-                    routing_table = response.propertyValue.cast_out(SequenceOf(SequenceOf(Unsigned)))
-                    _log.debug(f"Received routing table: {routing_table}")
-                    return routing_table
-                except Exception as e:  
-                    _log.error(f"Error extracting routing table data: {e}")
-                    return None
-            else:
-                _log.error(f"Unexpected response when requesting routing table: {response}")
-                return None
-    
-        except (CommunicationError, TimeoutError) as e:
-            _log.error(f"Error requesting routing table: {e}")
-            return None
+    try:
+        request = ReadPropertyRequest(
+            objectIdentifier=('device', self.device_id),
+            propertyIdentifier='routingTable'
+        )
+        request.pduDestination = self.address
+
+        response = await self.app.request(request)
+
+        if isinstance(response, ReadPropertyACK):
+            try:
+                routing_table = response.propertyValue.cast_out(SequenceOf(SequenceOf(Unsigned)))
+                _log.debug(f"Received routing table: {routing_table}")
+                return routing_table
+            except Exception as e:  
+                _log.error(f"Error extracting routing table data: {e}")
+        elif isinstance(response, (Error, Reject, Abort)):
+            _log.error(f"Error in routing table response: {response.errorClass} - {response.errorCode}")
+        else:
+            _log.error(f"Unexpected response when requesting routing table: {response}")
+
+    except TimeoutError as e:
+        _log.error(f"Timeout error while requesting routing table: {e}")
+    except BACpypesError as e:
+        _log.error(f"BACpypes error requesting routing table: {e}")
+
+    return None  # Indicate failure
+
     
     
     # is_available
@@ -644,17 +434,36 @@ class BBMD:
             self.routing_table = new_routing_table
             self.last_update_time = time.time()
             
-    # validate_object_and_property
-    def validate_object_and_property(self, obj_id, property_identifier):
-        """
-        Validates if the object and property exist on the device.
-        Raises ValueError if not valid.
-        """
-        # Implement object/property validation logic here
-        # You'll need to access the device's object list (possibly from self.app.deviceInfoCache)
-        # and check if the obj_id and property_identifier are valid for that object type
-        pass  # Placeholder - Replace with your validation logic
-    
+async def validate_object_and_property(self, device_id, obj_id, prop_id):
+    """Validates if the object and property exist on the device using BACpypes3 services."""
+    _log.debug(f"Validating object {obj_id} and property {prop_id} on device {device_id}")
+
+    try:
+        # 1. Read Object List
+        object_list = await self.get_object_list(device_id)
+        if obj_id not in object_list:
+            _log.warning(f"Object {obj_id} not found on device {device_id}")
+            return False
+
+        # 2. Read Property List for the Object
+        property_list_result = await self.property_reader.read_property(device_id, obj_id, 'propertyList')
+        if not isinstance(property_list_result, ReadPropertyACK):
+            _log.error(f"Failed to read propertyList for object {obj_id} on device {device_id}")
+            return False
+
+        property_list = [prop.identifier for prop in property_list_result.propertyValue[0].value]
+
+        # 3. Check if Property is in the List
+        if prop_id not in property_list:
+            _log.warning(f"Property {prop_id} not found for object {obj_id} on device {device_id}")
+            return False
+
+        return True  # Object and property are valid
+
+    except (CommunicationError, TimeoutError, BACpypesError) as e:
+        _log.error(f"Error validating object and property on device {device_id}: {e}")
+        return False
+            
     # handle_topology_change (New method)
     async def handle_topology_change(self):
         """
@@ -741,7 +550,7 @@ class BBMDManager:
 
 
 class AlarmManager:
-    def __init__(self, app: BIPSimpleApplication):
+    def __init__(self, app: Application):  # Now BIPSimpleApplication is defined
         self.app = app
         self.active_alarms = {}
         self.acknowledged_alarms = set()
@@ -753,31 +562,32 @@ class AlarmManager:
         self.alarm_flood_active = defaultdict(lambda: False)
         self.load_silenced_alarms()
 
-    async def handle_cov_notification(self, property_identifier, property_value, subscription):
-        """Handles incoming COV notifications and manages alarms."""
-        _log.debug(f"Handling COV notification for {subscription.obj_id}.{subscription.prop_id} on device {subscription.device_id}: Value={property_value}")
+async def handle_cov_notification(self, property_identifier, property_value, subscription):
+    """Handles incoming COV notifications and manages alarms."""
+    _log.debug(f"Handling COV notification for {subscription.obj_id}.{subscription.prop_id} on device {subscription.device_id}: Value={property_value}")
 
-        obj_id = subscription.obj_id
-        prop_id = subscription.prop_id
-        device_id = subscription.device_id
+    obj_id = subscription.obj_id
+    prop_id = subscription.prop_id
+    device_id = subscription.device_id
 
-        # Get recent values for trend analysis (same as before)
+    try:
+        # 1. Get Recent Values for Trend Analysis
         history = self.app.cov_history.get(obj_id, {}).get(prop_id, [])
-        recent_values = history[-10:]
+        recent_values = history[-10:]  # Get the last 10 values or fewer
 
-        # Change Filtering (same as before)
+        # 2. Change Filtering
         if subscription.change_filter and recent_values:
             previous_value = recent_values[-1][1]
             if abs(property_value - previous_value) < subscription.change_filter:
                 _log.debug(f"Skipping notification for {obj_id}.{prop_id} due to change filter.")
                 return
 
-        # Alarm Flood Detection (same as before)
+        # 3. Alarm Flood Detection
         alarm_key = (device_id, obj_id, prop_id)
         if not self.is_alarm_silenced(alarm_key):
             await self.detect_alarm_flood(alarm_key)
 
-        # Alarm Logic (Only if not in alarm flood) (same as before)
+        # 4. Alarm Logic (Only if not in alarm flood)
         if not self.is_alarm_flood_active(device_id):
             for alarm in subscription.alarms:
                 alarm_type = alarm["type"]
@@ -800,11 +610,11 @@ class AlarmManager:
                 elif full_alarm_key in self.active_alarms:
                     await self.clear_alarm(*full_alarm_key)
 
-        # Anomaly Detection (Using Z-Score) (same as before)
+        # 5. Anomaly Detection (Using Z-Score)
         if len(recent_values) >= 2:  # Ensure enough data for Z-score calculation
-            timestamps, values = zip(*recent_values)
+            _, values = zip(*recent_values)
             z_scores = (np.array(values) - np.mean(values)) / np.std(values)
-            if any(abs(z) > 2 for z in z_scores):  # Check if any z-score is above threshold
+            if any(abs(z) > 2 for z in z_scores):  # Threshold of 2 for anomaly
                 await self.trigger_alarm(
                     device_id,
                     obj_id,
@@ -816,50 +626,64 @@ class AlarmManager:
                     severity="minor",
                 )
 
-    async def trigger_alarm(self, device_id, obj_id, prop_id, alarm_type, alarm_value, priority=None, z_score=None, severity="medium", history=None):
-        """Triggers an alarm, stores it, and sends a notification."""
-        _log.debug(f"Entering trigger_alarm for {obj_id}.{prop_id} on {device_id} with type {alarm_type} and value {alarm_value}")
-    
-        alarm_key = (device_id, obj_id, prop_id, alarm_type)
-    
-        # Check for existing alarm and update if necessary (same as before)
-        existing_alarm = self.active_alarms.get(alarm_key)
-        if existing_alarm:
-            if existing_alarm["severity"] != severity or existing_alarm["alarm_value"] != alarm_value:
-                _log.info(f"Updating active alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}: Value={alarm_value}, Z-score={z_score}, Severity={severity}")
-                existing_alarm.update({
-                    "timestamp": time.time(),
-                    "alarm_value": alarm_value,
-                    "z_score": z_score,
-                    "severity": severity,
-                })
-    
-                self.app.save_alarm_to_db(*alarm_key, alarm_value, z_score, existing_alarm["is_anomaly"])
-            else:
-                _log.debug(f"Alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id} already active and unchanged.")
-                return  # No need to trigger again
-    
-        else:  # New alarm
-            _log.info(f"Triggering new alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}: Value={alarm_value}, Z-score={z_score}")
-            
-            # Initialize alarm data
-            self.active_alarms[alarm_key] = {
+    except BACpypesError as e:
+        _log.error(f"BACpypes error handling COV notification: {e}")
+
+
+async def trigger_alarm(self, device_id, obj_id, prop_id, alarm_type, alarm_value, priority=None, z_score=None, severity="medium", history=None):
+    """Triggers an alarm, stores it, and sends a notification."""
+    _log.debug(f"Entering trigger_alarm for {obj_id}.{prop_id} on {device_id} with type {alarm_type} and value {alarm_value}")
+
+    alarm_key = (device_id, obj_id, prop_id, alarm_type)
+
+    # Check for existing alarm and update if necessary (same as before)
+    existing_alarm = self.active_alarms.get(alarm_key)
+    if existing_alarm:
+        if existing_alarm["severity"] != severity or existing_alarm["alarm_value"] != alarm_value:
+            _log.info(f"Updating active alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}: Value={alarm_value}, Z-score={z_score}, Severity={severity}")
+            existing_alarm.update({
                 "timestamp": time.time(),
-                "alarm_type": alarm_type,
                 "alarm_value": alarm_value,
-                "priority": priority,
                 "z_score": z_score,
                 "severity": severity,
-                "is_anomaly": alarm_type == "Anomaly",
-            }
+            })
+
+            try:
+                self.app.save_alarm_to_db(*alarm_key, alarm_value, z_score, existing_alarm["is_anomaly"])
+            except sqlite3.IntegrityError as e:
+                _log.error(f"Database integrity error while updating alarm: {e}")
+            except sqlite3.Error as e:
+                _log.error(f"Database error while updating alarm: {e}")
+        else:
+            _log.debug(f"Alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id} already active and unchanged.")
+            return  # No need to trigger again
+    else:  # New alarm
+        _log.info(f"Triggering new alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}: Value={alarm_value}, Z-score={z_score}")
+
+        # Initialize alarm data
+        self.active_alarms[alarm_key] = {
+            "timestamp": time.time(),
+            "alarm_type": alarm_type,
+            "alarm_value": alarm_value,
+            "priority": priority,
+            "z_score": z_score,
+            "severity": severity,
+            "is_anomaly": alarm_type == "Anomaly",
+        }
+
+        try:
             self.app.save_alarm_to_db(*alarm_key, alarm_value, z_score, self.active_alarms[alarm_key]["is_anomaly"])
-    
-        # Send initial notification (level 1)
-        asyncio.create_task(self.send_alarm_notification(alarm_key, history=history))
-    
-        # Escalation for new or upgraded critical alarms (same as before)
-        if severity == "critical" and (existing_alarm is None or existing_alarm["severity"] != "critical"):
-            asyncio.create_task(self.escalate_alarm(alarm_key))
+        except sqlite3.IntegrityError as e:
+            _log.error(f"Database integrity error while triggering alarm: {e}")
+        except sqlite3.Error as e:
+            _log.error(f"Database error while triggering alarm: {e}")
+
+    # Send initial notification (level 1) (same as before)
+    asyncio.create_task(self.send_alarm_notification(alarm_key, history=history))
+
+    # Escalation for new or upgraded critical alarms (same as before)
+    if severity == "critical" and (existing_alarm is None or existing_alarm["severity"] != "critical"):
+        asyncio.create_task(self.escalate_alarm(alarm_key))
     
     
     async def escalate_alarm(self, alarm_key):
@@ -988,33 +812,44 @@ class AlarmManager:
         else:
             return "Stable"
      
-    async def clear_alarm(self, device_id, obj_id, prop_id, alarm_type):
-        """Clears a previously triggered alarm."""
-        _log.debug(f"Clearing alarm of type '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}")
-    
-        alarm_key = (device_id, obj_id, prop_id, alarm_type)
-    
-        # If the alarm is acknowledged, remove it from the acknowledged alarms set
-        if alarm_key in self.acknowledged_alarms:
-            self.acknowledged_alarms.remove(alarm_key)
-    
-        # Remove the alarm from active alarms
+async def clear_alarm(self, device_id, obj_id, prop_id, alarm_type):
+    """Clears a previously triggered alarm."""
+    _log.debug(f"Clearing alarm of type '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}")
+
+    alarm_key = (device_id, obj_id, prop_id, alarm_type)
+
+    # Remove from acknowledged alarms (if present)
+    if alarm_key in self.acknowledged_alarms:
+        self.acknowledged_alarms.remove(alarm_key)
+
+    try:
+        # Check for alarm in active alarms
         if alarm_key in self.active_alarms:
+            # Remove from active alarms
             del self.active_alarms[alarm_key]
-    
+
             # Update the database to mark the alarm as cleared
-            try:
-                with self.app.db_conn:
-                    cursor = self.app.db_conn.cursor()
-                    cursor.execute(
-                        "UPDATE alarms SET cleared = 1, timestamp = ? WHERE device_id = ? AND object_id = ? AND property_id = ? AND alarm_type = ?",
-                        (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), device_id[1], str(obj_id), prop_id, alarm_type)
-                    )
-                _log.info(f"Alarm {alarm_key} cleared in the database.")
-            except sqlite3.Error as e:
-                _log.error(f"Error clearing alarm in database: {e}")
+            with self.app.db_conn:
+                cursor = self.app.db_conn.cursor()
+                cursor.execute(
+                    "UPDATE alarms SET cleared = 1, timestamp = ? WHERE device_id = ? AND object_id = ? AND property_id = ? AND alarm_type = ?",
+                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), device_id[1], str(obj_id), prop_id, alarm_type)
+                )
+
+            _log.info(f"Alarm {alarm_key} cleared in database.")
+
+            # Send notification of alarm clearing
+            await self.send_alarm_notification(alarm_key, message_prefix="CLR: ")
+
+            # Cancel escalation task if one is running
+            self._cancel_escalation_task(alarm_key)
         else:
             _log.warning(f"Tried to clear an alarm that was not active: {alarm_key}")
+    except sqlite3.IntegrityError as e:
+        _log.error(f"Database integrity error while clearing alarm: {e}")
+    except sqlite3.Error as e:
+        _log.error(f"Error clearing alarm in database: {e}")
+
                               
         # In the trigger_alarm function
         # await self.send_alarm_notification(alarm_key)  # Initial notification (level 1)
@@ -1238,7 +1073,6 @@ class AlarmManager:
         silence_end_time = self.silenced_alarms.get(alarm_key)
         return silence_end_time is not None and time.time() < silence_end_time
     
-    # ... (detect_alarm_flood, deactivate_alarm_flood, and is_alarm_flood_active remain the same) ...
     
     def silence_alarm(self, device_id, obj_id, prop_id, alarm_type, duration):
         """Silences an alarm."""
@@ -1280,14 +1114,15 @@ class AlarmManager:
             except sqlite3.Error as e:
                 _log.error(f"Error removing silenced alarm from database: {e}")
     
-    def detect_alarm_flood(self, alarm_key):
-        """Detects and handles alarm floods."""
-        _log.debug(f"Checking for alarm flood: {alarm_key}")
-    
-        device_id = alarm_key[0]
-        now = time.time()
-        time_window_start = now - (now % self.flood_detection_window)
-    
+async def detect_alarm_flood(self, alarm_key):
+    """Detects and handles alarm floods."""
+    _log.debug(f"Checking for alarm flood: {alarm_key}")
+
+    device_id = alarm_key[0]
+    now = time.time()
+    time_window_start = now - (now % self.flood_detection_window)
+
+    try:
         self.alarm_counts[device_id][time_window_start] += 1
         if (
             self.alarm_counts[device_id][time_window_start] > self.flood_threshold
@@ -1295,18 +1130,23 @@ class AlarmManager:
         ):
             _log.warning(f"Alarm flood detected on device {device_id}!")
             self.alarm_flood_active[device_id] = True
-    
+
             # Send flood notification (modify this to your preferred method)
             message_content = f"Alarm flood detected on device {device_id}!"
-            asyncio.create_task(self.app.send_email_notification(message_content, "admin@example.com")) 
-    
+            asyncio.create_task(
+                self.app.send_email_notification(message_content, "admin@example.com")
+            )
+
             # Schedule flood deactivation
             asyncio.create_task(self.deactivate_alarm_flood(device_id))
-                                  
+    except BACpypesError as e:
+        _log.error(f"BACpypes error during alarm flood detection: {e}")
+
+                              
 # ******************************************************************************
 
 
-class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
+class BACeeApp(Application):
     def __init__(self, *args, **kwargs):
         """Initializes the BACeeApp with local device settings, network configuration, and BBMDs."""
     
@@ -1659,94 +1499,95 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
         return discovered_devices
     
      
-    def validate_registration(self, registration_data, device_id):
-        """Validates registration data against the database, ensuring consistency."""
-        _log.debug(f"Validating registration data for device {device_id}: {registration_data}")
-    
-        try:
-            # Validate Object and Property Identifiers (assuming self.validate_object_and_property is implemented)
-            for obj_id, prop_ids in registration_data.get('objects_properties', {}).items():
-                if not self.validate_object_and_property(obj_id, prop_ids):
-                    _log.warning(f"Invalid object or property in registration data for device {device_id}")
+async def validate_registration(self, registration_data, device_id):
+    """Validates registration data against the device's capabilities and the database."""
+
+    _log.debug(f"Validating registration data for device {device_id}: {registration_data}")
+
+    try:
+        # Validate device ID type
+        if not isinstance(device_id, int):
+            raise ValueError(f"Invalid device ID: {device_id}")
+
+        # 1. Validate Object and Property Identifiers Against Device
+        for obj_id_str, prop_ids in registration_data.get('objects_properties', {}).items():
+            obj_id = eval(obj_id_str)  # Convert string back to tuple 
+            for prop_id in prop_ids:
+                if not await self.validate_object_and_property(device_id, obj_id, prop_id):
+                    _log.warning(f"Invalid object or property in registration data for device {device_id}: {obj_id}.{prop_id}")
                     return False  # Exit early on invalid data
-    
-            with self.db_conn:  # Use context manager for automatic transaction handling
-                cursor = self.db_conn.cursor()
-                cursor.execute(
-                    "SELECT objects_properties FROM registered_devices WHERE device_id = ?", (device_id,)
-                )
-                row = cursor.fetchone()
-    
-                if row:
-                    # Data exists in DB: Compare and update if necessary
-                    db_data = json.loads(row[0])
-                    if db_data != registration_data.get('objects_properties', {}):
-                        _log.warning(f"Inconsistent registration data in database for device {device_id}. Overwriting with new data.")
-                        cursor.execute(
-                            "UPDATE registered_devices SET objects_properties = ? WHERE device_id = ?",
-                            (json.dumps(registration_data.get('objects_properties', {})), device_id),
-                        )
-                else:
-                    # Data doesn't exist in DB: Insert new registration
-                    _log.info(f"No existing registration data found for device {device_id}. Saving new data.")
+
+        # 2. Retrieve Existing Registration Data (if any) from Database
+        with self.db_conn:
+            cursor = self.db_conn.cursor()
+            cursor.execute(
+                "SELECT objects_properties FROM registered_devices WHERE device_id = ?",
+                (device_id,),
+            )
+            row = cursor.fetchone()
+
+        if row:
+            # 3. Compare Against Database (if entry exists)
+            db_data = json.loads(row[0])
+            if db_data != registration_data.get('objects_properties', {}):
+                _log.warning(f"Inconsistent registration data in database for device {device_id}. Overwriting with new data.")
+                with self.db_conn:  # Use context manager to ensure atomic update
                     cursor.execute(
-                        "INSERT INTO registered_devices (device_id, objects_properties) VALUES (?, ?)",
-                        (device_id, json.dumps(registration_data.get('objects_properties', {}))),
+                        "UPDATE registered_devices SET objects_properties = ? WHERE device_id = ?",
+                        (json.dumps(registration_data.get('objects_properties', {})), device_id),
                     )
+            else:
+                _log.debug(f"Registration data for device {device_id} matches database entry.")
+        else:
+            # 4. Insert into Database (if no existing entry)
+            _log.info(f"No existing registration data found for device {device_id}. Saving new data.")
+            with self.db_conn:
+                cursor.execute(
+                    "INSERT INTO registered_devices (device_id, objects_properties) VALUES (?, ?)",
+                    (device_id, json.dumps(registration_data.get('objects_properties', {}))),
+                )
     
-        except sqlite3.Error as e:
-            _log.error(f"Error during registration validation: {e}")
-            return False  # Return False on database errors
-    
-        return True
+    except sqlite3.Error as e:
+        _log.error(f"Error during registration validation: {e}")
+        return False
+    except (KeyError, ValueError, TypeError) as e:
+        _log.error(f"Invalid registration data format: {e}")
+        return False
+    except Exception as e:  # Catch-all for unexpected errors
+        _log.exception(f"Unexpected error during registration validation: {e}")
+        return False
+
+    return True  
         
-    def validate_object_and_property(self, obj_id, prop_ids):
-        """Validates if the object and its properties exist on the device based on the BACnet standard.
-    
-        Args:
-            obj_id: A tuple representing the object identifier (e.g., ('analogInput', 1)).
-            prop_ids: A list of property identifiers to validate (e.g., ['presentValue', 'objectName']).
-    
-        Returns:
-            True if the object and all properties are valid, False otherwise.
-        """
-        _log.debug(f"Validating object {obj_id} and properties {prop_ids}")
-    
-        # 1. Get Object Type and Instance
-        try:
-            obj_type, obj_instance = obj_id
-        except (ValueError, TypeError):
-            _log.error(f"Invalid object identifier format: {obj_id}")
+async def validate_object_and_property(self, device_id, obj_id, prop_id):
+    """Validates if the object and property exist on the device using BACpypes3 services."""
+    _log.debug(f"Validating object {obj_id} and property {prop_id} on device {device_id}")
+
+    try:
+        # 1. Read Object List
+        object_list = await self.get_object_list(device_id)
+        if obj_id not in object_list:
+            _log.warning(f"Object {obj_id} not found on device {device_id}")
             return False
-    
-        # 2. Check if Object Type is Valid
-        if not isinstance(obj_type, str) or not isinstance(obj_instance, int):
-            _log.error(f"Invalid object type or instance: {obj_id}")
+
+        # 2. Read Property List for the Object
+        property_list_result = await self.property_reader.read_property(device_id, obj_id, 'propertyList')
+        if not isinstance(property_list_result, ReadPropertyACK):
+            _log.error(f"Failed to read propertyList for object {obj_id} on device {device_id}")
             return False
-        
-        try:
-            ObjectIdentifier(obj_id)  # Attempt to create ObjectIdentifier to ensure validity
-        except ValueError:
-            _log.error(f"Invalid object identifier: {obj_id}")
+
+        property_list = [prop.identifier for prop in property_list_result.propertyValue[0].value]
+
+        # 3. Check if Property is in the List
+        if prop_id not in property_list:
+            _log.warning(f"Property {prop_id} not found for object {obj_id} on device {device_id}")
             return False
-    
-        # 3. Check if Properties are Valid for the Object Type
-        if not isinstance(prop_ids, list):
-            _log.error(f"Invalid property identifiers format: {prop_ids}")
-            return False
-        
-        for prop_id in prop_ids:
-            if not isinstance(prop_id, str):
-                _log.error(f"Invalid property identifier format: {prop_id}")
-                return False
-    
-            if prop_id not in DeviceObject._properties:  # Use BACpypes' DeviceObject to check valid properties
-                _log.warning(f"Property '{prop_id}' not found in standard BACnet object properties.")
-                return False
-    
-        # If all checks pass, return True
-        _log.debug(f"Object {obj_id} and properties {prop_ids} are valid.")
-        return True
+
+        return True  # Object and property are valid
+
+    except (CommunicationError, TimeoutError, BACpypesError) as e:
+        _log.error(f"Error validating object and property on device {device_id}: {e}")
+        return False
     
     async def check_writable_properties(self, device_id, object_type, object_instance):
         """Checks writable properties for a given object on a device."""
@@ -1823,30 +1664,36 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
     
     
     # get_object_list
-    async def get_object_list(self, device_id):
-        """Retrieves object list for a device using ReadPropertyMultiple, utilizing the cache."""
-        _log.debug(f"Retrieving object list for device {device_id}")
+async def get_object_list(self, device_id):
+    """Retrieves object list for a device using ReadPropertyMultiple, utilizing the cache."""
+
+    _log.debug(f"Retrieving object list for device {device_id}")
+
+    device_info = self.deviceInfoCache.get_device_info(device_id)
+    if device_info is None:
+        _log.error(f"Device with ID {device_id} not found.")
+        return None
     
-        device_info = self.deviceInfoCache.get_device_info(device_id)
-        if device_info is None:
-            _log.error(f"Device with ID {device_id} not found.")
-            return None
-    
-        # Check the device cache for the object list
-        if device_info.object_list:
-            return device_info.object_list
-        
-        # Fallback to ReadProperty if not in cache
-        object_list_result = await self.property_reader.read_property(device_id, ('device', device_id), 'objectList')
-        
-        if isinstance(object_list_result, ReadPropertyACK):
-            device_info.object_list = [
-                obj_id.objectIdentifier for obj_id in object_list_result.propertyValue[0].value
-            ]
-            return device_info.object_list
+    # Check the device cache for the object list
+    if device_info.object_list:
+        return device_info.object_list
+
+    try:
+        result = await self.property_reader.read_multiple_properties(
+            device_id, ("device", device_id), ["objectList"]
+        )
+        if result is not None and "objectList" in result:
+            object_list = [item.objectIdentifier for item in result["objectList"][0].value]
+            # Update DeviceInfoCache
+            device_info.object_list = object_list
+            return object_list
         else:
             _log.error(f"Failed to read object list for device {device_id}")
             return None
+
+    except (CommunicationError, TimeoutError, BACpypesError) as e:  # Catch specific BACpypes errors
+        _log.error(f"Error reading object list from device {device_id}: {e}")
+        return None
     
     
     # iter_objects
@@ -1857,115 +1704,142 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
             yield obj_id
     
     
-    async def do_ConfirmedCOVNotification(self, apdu: ConfirmedCOVNotificationRequest):
-        """Handles incoming COV notifications."""
-        _log.debug(f"Received ConfirmedCOVNotification from {apdu.initiatingDeviceIdentifier}")
-        
-        try:
-            device_id = apdu.initiatingDeviceIdentifier
-            device_info = self.deviceInfoCache.get_device_info(device_id)
-    
-            if not device_info:
-                _log.warning(f"Received COV notification from unknown device: {device_id}")
-                return
-    
-            obj_id = apdu.monitoredObjectIdentifier
-            prop_id = apdu.monitoredPropertyIdentifier
-    
-            # Handle sequence of values if present
-            if isinstance(apdu.listOfValues[0].propertyValue, SequenceOf):
-                values = [element.value for element in apdu.listOfValues[0].propertyValue]
-            else:
-                values = apdu.listOfValues[0].propertyValue
-    
-            _log.info(f"Received COV notification from {device_id}: {obj_id}.{prop_id} = {values}")
-    
-            # Update COV history
-            self.cov_history[obj_id][prop_id].append((time.time(), values))
-            self.alarm_manager.save_cov_notification_to_db(device_id, obj_id, prop_id, values)
-    
-            # Check if the property change is to the objectList
-            if prop_id == "objectList":
-                _log.info(f"Object list changed for device {device_id}, refreshing device information.")
-                self.deviceInfoCache.remove_device_info(device_id)
-                asyncio.create_task(self.discover_devices())  # Rediscover device objects
-                return  # No need to process further since object list has changed
-    
-            # Find subscription(s) and trigger alarm manager (if any)
-            for subscription in self.subscriptions.values():  # Iterate over values directly
-                if subscription.device_id == device_id and subscription.obj_id == obj_id and subscription.prop_id == prop_id:
-                    await self.alarm_manager.handle_cov_notification(prop_id, values, subscription)
-                    await socketio.emit('property_update', 
-                                       {'deviceId': subscription.device_id, 'objectId': subscription.obj_id, 
-                                        'propertyId': prop_id, 'value': values}, to=request.sid)
-    
-        except Exception as e:
-            _log.exception(f"Error processing COV notification for device {device_id}, object {obj_id}, property {prop_id}: {e}")
-    
-                
-    async def subscribe_cov(self, subscription: Subscription, renew: bool = False, timeout: int = 5):
-        """Subscribes or renews a COV subscription for the given property."""
-        _log.debug(f"{'Renewing' if renew else 'Subscribing to'} COV for {subscription.obj_id}.{subscription.prop_id} on device {subscription.device_id}")
-    
-        device_info = self.deviceInfoCache.get_device_info(subscription.device_id)
+async def do_ConfirmedCOVNotification(self, apdu: ConfirmedCOVNotificationRequest):
+    """Handles incoming confirmed COV notifications."""
+    _log.debug(f"Received ConfirmedCOVNotification from {apdu.initiatingDeviceIdentifier}")
+
+    try:
+        device_id = apdu.initiatingDeviceIdentifier
+        device_info = self.deviceInfoCache.get_device_info(device_id)
+
         if not device_info:
-            _log.error(f"Device with ID {subscription.device_id} not found. Cannot subscribe.")
+            _log.warning(f"Received COV notification from unknown device: {device_id}")
             return
-    
-        try:
-            # Create the SubscribeCOVRequest
-            cov_request = SubscribeCOVRequest(
-                subscriberProcessIdentifier=self.localDevice.objectIdentifier[1],  # Assumes local device object exists
-                monitoredObjectIdentifier=subscription.obj_id,
-                issueConfirmedNotifications=subscription.confirmed_notifications,
-                lifetimeInSeconds=subscription.lifetime_seconds,
+
+        obj_id = apdu.monitoredObjectIdentifier
+        prop_id = apdu.monitoredPropertyIdentifier
+
+        # Handle sequence of values if present
+        if isinstance(apdu.listOfValues[0].propertyValue, SequenceOf):
+            values = [element.value for element in apdu.listOfValues[0].propertyValue]
+        else:
+            values = apdu.listOfValues[0].propertyValue
+
+        _log.info(f"Received COV notification from {device_id}: {obj_id}.{prop_id} = {values}")
+
+        # Update COV history
+        self.cov_history[obj_id][prop_id].append((time.time(), values))
+        self.alarm_manager.save_cov_notification_to_db(device_id, obj_id, prop_id, values)
+
+        # Handle objectList changes (optional)
+        if prop_id == "objectList":
+            _log.info(
+                f"Object list changed for device {device_id}, refreshing device information."
             )
-            if subscription.cov_increment is not None:
-                cov_request.covIncrement = subscription.cov_increment
-            elif subscription.cov_increment_percentage is not None:
-                cov_request.covIncrementPercentage = subscription.cov_increment_percentage
-            
-            # Create the task and store it in the subscription
-            task = asyncio.create_task(self._process_subscription(subscription, cov_request))
-            subscription.cov_task = task
+            self.deviceInfoCache.remove_device_info(device_id)
+            asyncio.create_task(self.discover_devices())
+            return  # Exit early, no need to process further for objectList change
+
+        # Find matching subscriptions and trigger alarm manager (if any)
+        for subscription in self.subscriptions.values():
+            if (
+                subscription.device_id == device_id
+                and subscription.obj_id == obj_id
+                and subscription.prop_id == prop_id
+            ):
+                await self.alarm_manager.handle_cov_notification(
+                    prop_id, values, subscription
+                )
+                
+                # Send SocketIO notification (if using SocketIO)
+                await socketio.emit('property_update', {
+                    'deviceId': subscription.device_id,
+                    'objectId': subscription.obj_id,
+                    'propertyId': prop_id,
+                    'value': values
+                })  
+
+    except (DecodingError, SegmentationError) as e:
+        _log.error(f"Error decoding or segmenting COV notification: {e}")
+    except BACpypesError as e:
+        _log.error(f"BACpypes error processing COV notification: {e}")
+    except Exception as e:  # Catch-all for unexpected errors
+        _log.exception(f"Unexpected error processing COV notification: {e}")
+
     
-        except asyncio.TimeoutError:
-            _log.error(f"Subscription timeout for {subscription.obj_id}.{subscription.prop_id} on device {subscription.device_id}")
-            subscription.active = False
+async def subscribe_cov(self, subscription: Subscription, renew: bool = False, timeout: int = 5):
+    """Subscribes to or renews a COV subscription for the given property."""
+
+    _log.debug(
+        f"{'Renewing' if renew else 'Subscribing to'} COV for "
+        f"{subscription.obj_id}.{subscription.prop_id} on device {subscription.device_id}"
+    )
+
+    device_info = self.deviceInfoCache.get_device_info(subscription.device_id)
+    if not device_info:
+        _log.error(
+            f"Device with ID {subscription.device_id} not found. Cannot subscribe."
+        )
+        return
+
+    try:
+        # Create the SubscribeCOVRequest
+        cov_request = SubscribeCOVRequest(
+            subscriberProcessIdentifier=self.localDevice.objectIdentifier[1],
+            monitoredObjectIdentifier=subscription.obj_id,
+            issueConfirmedNotifications=subscription.confirmed_notifications,
+            lifetimeInSeconds=subscription.lifetime_seconds,
+        )
+        if subscription.cov_increment is not None:
+            cov_request.covIncrement = subscription.cov_increment
+        elif subscription.cov_increment_percentage is not None:
+            cov_request.covIncrementPercentage = subscription.cov_increment_percentage
+
+        # Create the task and store it in the subscription
+        task = asyncio.create_task(self._process_subscription(subscription, cov_request))
+        subscription.cov_task = task
+
+        _log.info(f"COV subscription for {subscription.obj_id}.{subscription.prop_id} on device {subscription.device_id} {'renewed' if renew else 'created'} successfully.")
+        return True
+    except asyncio.TimeoutError:
+        _log.error(f"Subscription timeout for {subscription.obj_id}.{subscription.prop_id} on device {subscription.device_id}")
+    except (CommunicationError, BACpypesError) as e:  # Catch specific BACpypes errors
+        _log.error(f"Error subscribing to COV: {e}")
+    except Exception as e:  # Catch-all for unexpected errors
+        _log.exception(f"Unexpected error during COV subscription: {e}")
     
-        except (CommunicationError, BACpypesError) as e:  # Catch specific BACpypes errors
-            _log.error(f"Error subscribing to COV: {e}")
-            subscription.active = False
-    
-        except Exception as e:  # Catch-all for unexpected errors
-            _log.exception(f"Unexpected error during COV subscription: {e}")
-            subscription.active = False
-    
-    async def _process_subscription(self, subscription: Subscription, cov_request: SubscribeCOVRequest):
-        """Handles the async context for COV subscriptions and renewals."""
-        device_info = self.deviceInfoCache.get_device_info(subscription.device_id)
-        async with self.change_of_value(
-            device_info.address,
-            subscription.obj_id,
-            subscription.prop_id,
-            subscription.confirmed_notifications,
-            subscription.lifetime_seconds,
-            cov_request,
-        ) as scm:
-            subscription.context_manager = scm
-    
-            # Handle COV Notifications
-            while not scm.is_fini:
-                try:
-                    property_identifier, property_value = await scm.get_value()
-                    _log.info(f"Received COV notification: {subscription.obj_id}.{property_identifier} = {property_value}")
-                    await self.alarm_manager.handle_cov_notification(property_identifier, property_value, subscription)
-                    await socketio.emit('property_update', {'deviceId': subscription.device_id, 'objectId': subscription.obj_id, 'propertyId': property_identifier, 'value': property_value})
-                except Exception as e:
-                    _log.exception(f"Error processing COV notification for subscription {subscription.obj_id}.{subscription.prop_id} on device {subscription.device_id}: {e}")
-                    break  # Exit loop on error
-    
-        _log.info(f"Subscription for {subscription.obj_id}.{subscription.prop_id} on device {subscription.device_id} ended.")
+    subscription.active = False # If any error happens, disable the subscription
+    return False  # Failed to subscribe
+
+
+async def _process_subscription(self, subscription: Subscription, cov_request: SubscribeCOVRequest):
+    """Handles the async context for COV subscriptions and renewals."""
+
+    device_info = self.deviceInfoCache.get_device_info(subscription.device_id)
+    async with self.change_of_value(
+        device_info.address,
+        subscription.obj_id,
+        subscription.prop_id,
+        subscription.confirmed_notifications,
+        subscription.lifetime_seconds,
+        cov_request,
+    ) as scm:
+        subscription.context_manager = scm
+
+        # Handle COV Notifications
+        while not scm.is_fini:
+            try:
+                property_identifier, property_value = await scm.get_value()
+                _log.info(f"Received COV notification: {subscription.obj_id}.{property_identifier} = {property_value}")
+                await self.alarm_manager.handle_cov_notification(property_identifier, property_value, subscription)
+                await socketio.emit('property_update', {'deviceId': subscription.device_id, 'objectId': subscription.obj_id, 'propertyId': property_identifier, 'value': property_value})
+            except Exception as e:
+                _log.exception(f"Error processing COV notification for subscription {subscription.obj_id}.{subscription.prop_id} on device {subscription.device_id}: {e}")
+                break  # Exit loop on error
+
+    _log.info(f"Subscription for {subscription.obj_id}.{subscription.prop_id} on device {subscription.device_id} ended.")
+    subscription.active = False  # Mark subscription as inactive when it ends
+
     
     async def manage_subscriptions(self):
         """Manages active subscriptions, including renewals."""
@@ -2003,40 +1877,43 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
             _log.error(f"Error unsubscribing from COV: {e}")
                 
     # Request IO
-    async def request_io(self, request, timeout=5, retries=3):
-        """Sends a BACnet request and handles retries with exponential backoff."""
-        _log.debug(f"Sending BACnet request: {request}")
-        
-        if self.bbmds and not request.pduDestination.is_broadcast:
-            selected_bbmd = self.select_bbmd(list(self.bbmds.values()))
-            if selected_bbmd and selected_bbmd.is_available():
-                request.pduDestination = selected_bbmd.address
-                _log.debug(f"Routing request through BBMD: {selected_bbmd.address}")
-            else:
-                _log.warning("No available BBMD found. Falling back to broadcast.")
-                request.pduDestination = Address(BROADCAST_ADDRESS)
+async def request_io(self, request, timeout=5, retries=3):
+    """Sends a BACnet request and handles retries with exponential backoff."""
+    _log.debug(f"Sending BACnet request: {request}")
+
+    # Determine the destination address (BBMD or broadcast)
+    if self.bbmds and not request.pduDestination.is_broadcast:
+        selected_bbmd = self.select_bbmd(list(self.bbmds.values()))
+        if selected_bbmd and selected_bbmd.is_available():
+            request.pduDestination = selected_bbmd.address
+            _log.debug(f"Routing request through BBMD: {selected_bbmd.address}")
         else:
+            _log.warning("No available BBMD found. Falling back to broadcast.")
             request.pduDestination = Address(BROADCAST_ADDRESS)
-    
-        for attempt in range(retries + 1):
-            try:
-                response = await asyncio.wait_for(self.request(request), timeout)
-                if response:
-                    _log.debug(f"Received response from {request.pduDestination}: {response}")
-                    return response
-                else:
-                    _log.warning(f"No response received from {request.pduDestination} in attempt {attempt + 1}/{retries + 1}")
-            except asyncio.TimeoutError:
-                _log.warning(f"Timeout error for request to {request.pduDestination}, attempt {attempt + 1} of {retries + 1}.")
-            except (CommunicationError, BACpypesError) as e:
-                _log.error(f"Error sending request to {request.pduDestination}: {e}")
-                return None  # Return immediately if a communication error happens
-    
-            if attempt < retries:  
-                await asyncio.sleep(2 ** attempt) 
-    
-        _log.error(f"Request to {request.pduDestination} failed after {retries} retries.")
-        return None  # Indicate failure after all retries
+    else:
+        request.pduDestination = Address(BROADCAST_ADDRESS)
+
+    # Retry logic with exponential backoff
+    for attempt in range(retries + 1):
+        try:
+            response = await asyncio.wait_for(self.request(request), timeout)
+            if response:
+                _log.debug(f"Received response from {request.pduDestination}: {response}")
+                return response
+            else:
+                _log.warning(f"No response received from {request.pduDestination} in attempt {attempt + 1}/{retries + 1}")
+        except asyncio.TimeoutError:
+            _log.warning(f"Timeout error for request to {request.pduDestination}, attempt {attempt + 1} of {retries + 1}.")
+        except (CommunicationError, BACpypesError) as e:
+            _log.error(f"Error sending request to {request.pduDestination}: {e}")
+            return None  # Return immediately if a communication error happens
+
+        if attempt < retries:  
+            await asyncio.sleep(2 ** attempt) 
+
+    _log.error(f"Request to {request.pduDestination} failed after {retries} retries.")
+    return None  # Indicate failure after all retries
+
 
 
     # do_RouterAvailable
@@ -2108,6 +1985,268 @@ class BACeeApp(BIPSimpleApplication, ChangeOfValueServices):
             # Sleep for one minute
             await asyncio.sleep(60)
 
+
+# ******************************************************************************
+
+# Subscription: deals with subscriptions to receive updates on specific properties
+
+class Subscription:
+    def __init__(self, device_id, obj_id, prop_id, confirmed_notifications=True, lifetime_seconds=None,
+        change_filter=None, priority=None,
+    ):
+        self.device_id = device_id
+        self.obj_id = obj_id
+        self.prop_id = prop_id
+        self.confirmed_notifications = confirmed_notifications
+        self.lifetime_seconds = lifetime_seconds
+        self.active = True
+        self.change_filter = change_filter
+        self.priority = priority
+        self.alarms = []
+        self.context_manager = None  # To store the SubscriptionContextManager
+
+
+    async def renew_subscription(self, app: BACeeApp, timeout: int = 5):
+        """Renews the COV subscription, handling potential errors gracefully."""
+
+        subscription_info = f"{self.obj_id}.{self.prop_id}"  
+
+        if not self.active:
+            _log.warning(f"Attempting to renew inactive subscription: {subscription_info}")
+            return
+
+        _log.info(f"Renewing COV subscription: {subscription_info}")
+
+        subscription_request = SubscribeCOVRequest(
+            subscriberProcessIdentifier=app.localDevice.objectIdentifier[1],  # Assumes local device object exists
+            monitoredObjectIdentifier=self.obj_id,
+            issueConfirmedNotifications=self.confirmed_notifications,
+            lifetimeInSeconds=self.lifetime_seconds,
+        )
+        if self.cov_increment is not None:
+            subscription_request.covIncrement = self.cov_increment
+        elif self.cov_increment_percentage is not None:
+            subscription_request.covIncrementPercentage = self.cov_increment_percentage
+
+        try:
+            response = await asyncio.wait_for(app.subscribe_cov(subscription_request, self), timeout=timeout)
+            if isinstance(response, SubscribeCOVRequest):  # Successful renewal returns original request
+                _log.info(f"Successfully renewed subscription: {subscription_info}")
+            else:
+                _log.error(f"Unexpected response received when trying to renew subscription: {subscription_info}")
+
+        except (Error, Reject, Abort) as e:  # Catch specific BACpypes3 errors
+            _log.error(f"Error renewing subscription: {subscription_info} - {e.errorClass} - {e.errorCode}")
+            self.active = False
+        except TimeoutError as e:
+            _log.error(f"Timeout renewing subscription: {subscription_info} after {timeout} seconds")
+            self.active = False
+        except Exception as e:  # Catch-all for unexpected errors
+            _log.exception(f"Unexpected error renewing subscription: {subscription_info} - {e}")
+            self.active = False
+
+            # ******************************************************************************
+
+        class PropertyReader:
+            def __init__(self, app: BACeeApp):
+                self.app = app
+
+            async def read_property(self, device_id, obj_id, prop_id):
+                """Reads a single property from a BACnet device, utilizing the DeviceInfoCache.
+
+                Args:
+                    device_id: The ID of the BACnet device.
+                    obj_id: The object identifier (e.g., 'analogInput:1').
+                    prop_id: The property identifier (e.g., 'presentValue').
+
+                Returns:
+                    The property value if successful, or None if an error occurred or the device/property is not found.
+                """
+
+                device_info = self.app.deviceInfoCache.get_device_info(device_id)
+                if not device_info:
+                    _log.error(f"Device with ID {device_id} not found in cache.")
+                    return None
+
+                # Check if the property is already cached
+                cached_value = device_info.get_object_property(obj_id, prop_id)
+                if cached_value is not None:
+                    _log.debug(f"Property {obj_id}.{prop_id} found in cache for device {device_id}: {cached_value}")
+                    return cached_value
+
+                # Property not cached, read from device
+                _log.debug(f"Reading property {obj_id}.{prop_id} from device {device_id}")
+                request = ReadPropertyRequest(objectIdentifier=obj_id, propertyIdentifier=prop_id)
+                request.pduDestination = device_info.address
+
+                try:
+                    response = await self.app.request(request)  # Assuming 'app' has a 'request' method
+                    if isinstance(response, ReadPropertyACK):
+                        value = response.propertyValue
+                        # Cache the value in DeviceInfoCache
+                        device_info.set_object_property(obj_id, prop_id, value)
+                        _log.debug(f"Read property {obj_id}.{prop_id} from device {device_id}: {value}")
+                        return value
+                    else:
+                        _log.error(
+                            f"Error reading property {obj_id}.{prop_id} on device {device_id}: Unexpected response type {response}")
+
+                except (CommunicationError, TimeoutError) as e:
+                    _log.error(f"Communication error reading property {obj_id}.{prop_id} from device {device_id}: {e}")
+
+                return None  # Return None on error or if property not found
+
+            async def read_multiple_properties(self, device_id, obj_id_prop_id_list):
+                """Reads multiple properties from multiple objects on a BACnet device using ReadPropertyMultiple.
+
+                Args:
+                    device_id: The ID of the BACnet device.
+                    obj_id_prop_id_list: A list of tuples, each containing an object ID and a property ID to read.
+
+                Returns:
+                    A dictionary where keys are (object ID, property ID) tuples and values are the corresponding property values.
+                    Returns None if an error occurs or the device is not found.
+                """
+
+                device_info = self.app.deviceInfoCache.get_device_info(device_id)
+                if not device_info:
+                    _log.error(f"Device with ID {device_id} not found in cache.")
+                    return None
+
+                # Group properties by object ID to create ReadAccessSpecification
+                object_property_map = defaultdict(list)
+                for obj_id, prop_id in obj_id_prop_id_list:
+                    object_property_map[obj_id].append(prop_id)
+
+                read_access_specs = []
+                for obj_id, prop_ids in object_property_map.items():
+                    read_access_specs.append((obj_id, prop_ids))
+
+                request = ReadPropertyMultipleRequest(
+                    device_address=device_info.address, properties=read_access_specs
+                )
+
+                try:
+                    response = await self.app.request(request)  # Assuming 'app' has a 'request' method
+                    if isinstance(response, ReadPropertyMultipleACK):
+                        values = {}
+                        for obj_prop_list in response.values:
+                            for prop_value in obj_prop_list:
+                                values[(prop_value.objectIdentifier, prop_value.propertyIdentifier)] = prop_value.value
+
+                        # Update the cache with the read values
+                        device_info.update_properties(values)  # Update the cache
+                        return values
+
+                    else:
+                        _log.error(
+                            f"Error reading multiple properties from device {device_id}: Unexpected response type {response}")
+
+                except (CommunicationError, TimeoutError) as e:
+                    _log.error(f"Communication error with device {device_id}: {e}")
+                    # You might want to handle the error more specifically, e.g., retry or raise a custom exception.
+
+                return None  # Return None on error or unexpected response
+
+# ******************************************************************************
+
+        class PropertyWriter(BIPSimpleApplication,
+                             WritePropertyService):  # Inherit from BIPSimpleApplication and WritePropertyService
+            def __init__(self, *args, **kwargs):
+                BIPSimpleApplication.__init__(self, *args, **kwargs)
+
+            async def write_property(self, device_id, obj_id, prop_id, value, priority=None):
+                """Writes a value to a BACnet property using BACpypes3's built-in WritePropertyService."""
+                try:
+                    device_info = self.app.deviceInfoCache.get_device_info(device_id)
+                    if not device_info:
+                        _log.error(f"Device with ID {device_id} not found. Cannot write property.")
+                        return
+
+                    # Convert value to appropriate BACnet type if needed (same logic as before)
+
+                    request = WritePropertyRequest(
+                        objectIdentifier=obj_id,
+                        propertyIdentifier=prop_id,
+                        propertyArrayIndex=None,
+                        propertyValue=value,
+                        priority=priority,
+                    )
+
+                    request.pduDestination = device_info.address
+                    response = await self.request(request)  # Use BIPSimpleApplication's request method
+
+                    if response.errorClass is None and response.errorCode is None:
+                        _log.info(f"Successfully wrote {value} to {obj_id}.{prop_id}")
+                        device_info.set_object_property(obj_id, prop_id, value)
+                    else:
+                        error_class = response.errorClass or "UnknownError"
+                        error_code = response.errorCode or "UnknownCode"
+                        _log.error(f"Failed to write {value} to {obj_id}.{prop_id}: {error_class} - {error_code}")
+                except Exception as e:
+                    _log.exception(f"Error writing {value} to {obj_id}.{prop_id}: {e}")
+
+            async def write_multiple_properties(self, device_id, obj_id, prop_values, priority=None):
+                """Writes multiple properties to a BACnet object using BACpypes3's WritePropertyMultipleService.
+
+                Args:
+                    device_id: The ID of the BACnet device.
+                    obj_id: The object identifier (e.g., 'analogValue:1').
+                    prop_values: A dictionary where keys are property identifiers and values are the values to write.
+                    priority: (Optional) The priority of the write.
+
+                Returns:
+                    None
+                """
+                device_info = self.app.deviceInfoCache.get_device_info(device_id)
+                if not device_info:
+                    _log.error(f"Device with ID {device_id} not found. Cannot write properties.")
+                    return
+
+                # Validate property values if necessary
+                for prop_id, value in prop_values.items():
+                    if not self.validate_property_value(obj_id, prop_id, value):
+                        _log.error(f"Invalid value {value} for property {prop_id} of object {obj_id}")
+                        return
+
+                write_access_spec_list = []
+                for prop_id, value in prop_values.items():
+                    prop_data_type = get_datatype(obj_id[0], prop_id)
+                    if isinstance(value, list):  # Handle list values as ArrayOf
+                        value = ArrayOf(prop_data_type, value)
+                    else:
+                        value = prop_data_type(value)  # Convert individual values to BACnet type
+                    write_access_spec_list.append(
+                        WritePropertyMultipleResult(
+                            propertyIdentifier=prop_id,
+                            propertyValue=value,
+                            priority=priority,
+                        )
+                    )
+
+                request = WritePropertyMultipleRequest(
+                    objectIdentifier=obj_id,
+                    listOfWriteAccessSpecs=[write_access_spec_list]  # List of lists for multiple properties
+                )
+                request.pduDestination = device_info.address
+                try:
+                    response = await self.multiple_write_property_request(
+                        request)  # Use WritePropertyMultipleService's request method
+
+                    for result in response:
+                        if result.propertyAccessError is not None:  # Check for errors in the result
+                            error_class = result.propertyAccessError.errorClass or "UnknownError"
+                            error_code = result.propertyAccessError.errorCode or "UnknownCode"
+                            _log.error(
+                                f"Error writing property {prop_id} of object {obj_id}: {error_class} - {error_code}"
+                            )
+                        else:
+                            _log.info(f"Successfully wrote to property {prop_id} of object {obj_id}")
+                            device_info.set_object_property(obj_id, prop_id, prop_values[prop_id])  # Update the cache
+
+                except Exception as e:
+                    _log.exception(f"Error writing multiple properties to {obj_id} on {device_id}: {e}")
+                    return
 
 # ******************************************************************************
 
@@ -2387,6 +2526,7 @@ async def cli_loop(app):
 
 app_flask = Flask(__name__)
 socketio = SocketIO(app_flask, cors_allowed_origins="*")  
+auth = HTTPBasicAuth()
 
 # WebSocket Events
 
@@ -2572,8 +2712,9 @@ def get_devices():
         return jsonify(devices)  # Return the list of devices as JSON
 
     except Exception as e:  # Catch-all for unexpected errors
-        _log.error(f"Error getting devices: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+        _log.exception(f"Error getting devices: {e}")
+        return jsonify({"error": "Internal Server Error"}), 500
+
 
 
 # get_device_objects
@@ -2591,6 +2732,9 @@ async def get_device_objects(device_id):
     except (CommunicationError, TimeoutError, BACpypesError) as e:
         _log.error(f"Error getting objects for device {device_id}: {e}")
         return jsonify({"error": "Communication Error"}), 500
+    except BACpypesError as e:
+        _log.error(f"BACpypes error getting objects for device {device_id}: {e}")
+        return jsonify({"error": "BACnet Communication Error"}), 500 
 
 
 
@@ -2628,13 +2772,13 @@ async def get_object_properties(object_type, object_instance):
         else:
             _log.error(f"Error reading properties from device {device_id}: {result}")
             return jsonify({"error": "Failed to read properties"}), 500
-    except (ValueError, KeyError, TypeError) as e:  # Catch more specific errors
+
+    except (KeyError, ValueError, TypeError) as e:  # Catch specific errors
         _log.error(f"Invalid request or error processing properties: {e}")
         return jsonify({"error": str(e)}), 400  # Bad Request for invalid input
-    except (CommunicationError, TimeoutError, BACpypesError) as e:
+    except BACpypesError as e:
         _log.error(f"Communication error with device {device_id}: {e}")
-        return jsonify({"error": "Communication Error"}), 500
-
+        return jsonify({"error": "BACnet Communication Error"}), 500  # Internal Server Error
 
 # handle_property
 @app_flask.route('/objects/<object_type>/<int:object_instance>/properties/<property_name>', methods=['GET', 'PUT'])
@@ -2665,20 +2809,16 @@ async def handle_property(object_type, object_instance, property_name):
             # ... (Add data type conversion logic here)
             await app.property_writer.write_property(device_id, obj_id, property_name, new_value)
             return jsonify({"message": "Property written successfully"})
-
-    except (ValueError, KeyError, TypeError) as e:
-        _log.error(f"Invalid request or error processing property: {e}")
-        return jsonify({"error": str(e)}), 400 
-    except (CommunicationError, TimeoutError, BACpypesError) as e:
-        _log.error(f"Communication error with device {device_id}: {e}")
-        return jsonify({"error": "Communication Error"}), 500
+    except (ValueError, KeyError) as e:
+        return jsonify({"error": str(e)}), 400
+    except BACpypesError as e:
+        return jsonify({"error": "BACnet communication error"}), 500
 
 
 @app_flask.route('/subscriptions', methods=['GET', 'POST', 'DELETE'])
 @auth.login_required
 async def handle_subscriptions():
     """Handles COV subscriptions: GET to list, POST to create, DELETE to remove."""
-
     _log.debug(f"Received {request.method} request for /subscriptions")
 
     try:
@@ -2725,9 +2865,10 @@ async def handle_subscriptions():
             return jsonify({"message": "Subscription created successfully."}), 201
 
         elif request.method == 'DELETE':
-            device_id = int(request.json.get('device_id'))
-            obj_id = (request.json.get('object_type'), int(request.json.get('object_instance')))
-            prop_id = request.json.get('property_identifier')
+            data = request.get_json()
+            device_id = int(data.get('device_id'))
+            obj_id = (data.get('object_type'), int(data.get('object_instance')))
+            prop_id = data.get('property_identifier')
 
             # Input Validation
             if not all([device_id, obj_id, prop_id]):
@@ -2776,9 +2917,10 @@ def get_alarms():
         ]
         all_alarms = active_alarms + acknowledged_alarms
         return jsonify(all_alarms)
+
     except Exception as e:  # Catch-all for unexpected errors
-        _log.error(f"Error getting alarms: {e}")
-        return jsonify({"error": "Internal server error"}), 500
+        _log.exception(f"Error getting alarms: {e}")
+        return jsonify({"error": "Internal Server Error"}), 500
 
     
 @app_flask.route('/alarms', methods=['PUT'])
@@ -2807,10 +2949,20 @@ async def handle_alarms():
         await app.alarm_manager.acknowledge_alarm(alarm_key)
 
         return jsonify({"message": f"Alarm {alarm_type} on {object_id} of device {device_id} acknowledged successfully"}), 200
-    except (ValueError, KeyError) as e:
+    except (ValueError, KeyError, TypeError) as e:
         _log.error(f"Error acknowledging alarm: {e}")
         return jsonify({"error": "Invalid request data"}), 400
-
+    except BACpypesError as e:
+        _log.error(f"BACpypes error acknowledging alarm: {e}")
+        return jsonify({"error": "BACnet Communication Error"}), 500
+    
+    
+# acknowledge_alarm (POST)
+@app_flask.route('/alarms/acknowledge', methods=['POST'])
+@auth.login_required
+async def acknowledge_alarm_post():
+    """API endpoint to acknowledge an alarm (alternative route)."""
+    return await handle_alarms()  
 
 @app_flask.route('/alarms/acknowledge', methods=['POST'])
 @auth.login_required
@@ -2845,69 +2997,6 @@ async def acknowledge_alarm():
 # silence_alarm
 @app_flask.route('/alarms/silence', methods=['POST'])
 @auth.login_required
-async def silence_alarm():
-    """API endpoint to silence an alarm."""
-    _log.debug("Received request to silence alarm.")
-
-    try:
-        data = request.get_json()
-        device_id = int(data.get('device_id'))
-        object_id = tuple(data.get('object_id'))
-        property_id = data.get('property_id')
-        alarm_type = data.get('alarm_type')
-        duration = int(data.get('duration', 300))  # Default silence duration of 5 minutes (300 seconds)
-
-        if not all([device_id, object_id, property_id, alarm_type]):
-            return jsonify({"error": "Missing required parameters."}), 400
-
-        alarm_key = (device_id, object_id, property_id, alarm_type)
-
-        # Verify if the alarm is active
-        if alarm_key not in app.alarm_manager.active_alarms:
-            return jsonify({"error": "Alarm not found or not active."}), 404
-
-        # Silence the alarm
-        app.alarm_manager.silence_alarm(device_id, object_id, property_id, alarm_type, duration)
-        return jsonify({"message": "Alarm silenced successfully."}), 200
-
-    except (ValueError, KeyError, TypeError) as e:
-        _log.error(f"Error silencing alarm: {e}")
-        return jsonify({"error": str(e)}), 400
-
-
-# get_alarm_history
-@app_flask.route('/alarms/history')
-@auth.login_required
-async def get_alarm_history():
-    """API endpoint to get alarm history."""
-    _log.debug("Fetching alarm history from database")
-    try:
-        query = "SELECT * FROM alarms ORDER BY timestamp DESC"  # Retrieve all alarms in descending order by timestamp
-        rows = fetch_data("bacee.db", query)  # Fetch data from the database
-        alarms = []
-        for row in rows:
-            alarm = {
-                'id': row[0],
-                'timestamp': row[1],
-                'device_id': row[2],
-                'object_id': row[3],
-                'property_id': row[4],
-                'alarm_type': row[5],
-                'alarm_value': row[6],
-                'z_score': row[7],
-                'is_anomaly': bool(row[8]),
-                'acknowledged': bool(row[9]),
-                'cleared': bool(row[10]),
-            }
-            alarms.append(alarm)
-        return jsonify(alarms), 200  # Return the alarms as JSON with a 200 OK status
-    except sqlite3.Error as e:
-        _log.error(f"Error retrieving alarm history from database: {e}")
-        return jsonify({"error": "Internal server error"}), 500
-
-    
-@app_flask.route('/alarms/silence', methods=['POST'])
-@auth.login_required
 def silence_alarm():
     """API endpoint to silence an alarm."""
     _log.debug("Received request to silence alarm.")
@@ -2937,6 +3026,38 @@ def silence_alarm():
         _log.error(f"Error silencing alarm: {e}")
         return jsonify({"error": str(e)}), 400
 
+
+
+# get_alarm_history
+@app_flask.route('/alarms/history')
+@auth.login_required
+async def get_alarm_history():
+    """API endpoint to get alarm history."""
+    _log.debug("Fetching alarm history from database")
+    try:
+        query = "SELECT * FROM alarms ORDER BY timestamp DESC"  # Retrieve all alarms in descending order by timestamp
+        rows = fetch_data("bacee.db", query)  # Fetch data from the database
+        alarms = []
+        for row in rows:
+            alarm = {
+                'id': row[0],
+                'timestamp': row[1],
+                'device_id': row[2],
+                'object_id': row[3],
+                'property_id': row[4],
+                'alarm_type': row[5],
+                'alarm_value': row[6],
+                'z_score': row[7],
+                'is_anomaly': bool(row[8]),
+                'acknowledged': bool(row[9]),
+                'cleared': bool(row[10]),
+            }
+            alarms.append(alarm)
+        return jsonify(alarms), 200  # Return the alarms as JSON with a 200 OK status
+
+    except sqlite3.Error as e:
+        _log.error(f"Error retrieving alarm history from database: {e}")
+        return jsonify({"error": "Database Error"}), 500
 
 def start_api_server():
     app_flask.run(host="0.0.0.0", port=5000)  # Start on all interfaces, port 5000
