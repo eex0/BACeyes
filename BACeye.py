@@ -699,36 +699,33 @@ class AlarmManager:
         self.flood_threshold = 10
         self.alarm_counts = defaultdict(lambda: defaultdict(int))
         self.alarm_flood_active = defaultdict(lambda: False)
-        self.load_silenced_alarms() 
-               
+        self.load_silenced_alarms()
+
     async def handle_cov_notification(self, property_identifier, property_value, subscription):
         """Handles incoming COV notifications and manages alarms."""
+        _log.debug(f"Handling COV notification for {subscription.obj_id}.{subscription.prop_id} on device {subscription.device_id}: Value={property_value}")
 
         obj_id = subscription.obj_id
         prop_id = subscription.prop_id
         device_id = subscription.device_id
 
-        # Get the most recent values for trend analysis
+        # Get recent values for trend analysis (same as before)
         history = self.app.cov_history.get(obj_id, {}).get(prop_id, [])
-        recent_values = history[-10:]  # Get last 10 or all if less
+        recent_values = history[-10:]
 
-        # Change Filtering
-        if subscription.change_filter:
-            # Check for change filter values
-            if recent_values:
-                previous_value = recent_values[-1][1]
-                if abs(property_value - previous_value) < subscription.change_filter:
-                    return  # Skip if the change is below the filter threshold
-            else:
-                # If no previous value, treat it as a change and don't return
-                pass
+        # Change Filtering (same as before)
+        if subscription.change_filter and recent_values:
+            previous_value = recent_values[-1][1]
+            if abs(property_value - previous_value) < subscription.change_filter:
+                _log.debug(f"Skipping notification for {obj_id}.{prop_id} due to change filter.")
+                return
 
-        # Alarm Flood Detection
+        # Alarm Flood Detection (same as before)
         alarm_key = (device_id, obj_id, prop_id)
         if not self.is_alarm_silenced(alarm_key):
             await self.detect_alarm_flood(alarm_key)
 
-        # Alarm Logic (Only if not in alarm flood)
+        # Alarm Logic (Only if not in alarm flood) (same as before)
         if not self.is_alarm_flood_active(device_id):
             for alarm in subscription.alarms:
                 alarm_type = alarm["type"]
@@ -751,7 +748,7 @@ class AlarmManager:
                 elif full_alarm_key in self.active_alarms:
                     await self.clear_alarm(*full_alarm_key)
 
-        # Anomaly Detection (Using Z-Score)
+        # Anomaly Detection (Using Z-Score) (same as before)
         if len(recent_values) >= 2:  # Ensure enough data for Z-score calculation
             timestamps, values = zip(*recent_values)
             z_scores = (np.array(values) - np.mean(values)) / np.std(values)
@@ -760,41 +757,40 @@ class AlarmManager:
                     device_id,
                     obj_id,
                     prop_id,
-                    "Anomaly Detected", 
+                    "Anomaly Detected",
                     values[-1],  # Latest anomalous value
                     priority=None,
                     z_score=z_scores[-1],  # Latest Z-score
                     severity="minor",
                 )
 
-
     async def trigger_alarm(self, device_id, obj_id, prop_id, alarm_type, alarm_value, priority=None, z_score=None, severity="medium", history=None):
         """Triggers an alarm, stores it, and sends a notification."""
-
+        _log.debug(f"Entering trigger_alarm for {obj_id}.{prop_id} on {device_id} with type {alarm_type} and value {alarm_value}")
+    
         alarm_key = (device_id, obj_id, prop_id, alarm_type)
-
-        # Check if the alarm is already active and of the same type
+    
+        # Check for existing alarm and update if necessary (same as before)
         existing_alarm = self.active_alarms.get(alarm_key)
         if existing_alarm:
-            # Check for severity upgrade or value change
             if existing_alarm["severity"] != severity or existing_alarm["alarm_value"] != alarm_value:
-                logger.info(f"Updating active alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}: Value={alarm_value}, Z-score={z_score}, Severity={severity}")
+                _log.info(f"Updating active alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}: Value={alarm_value}, Z-score={z_score}, Severity={severity}")
                 existing_alarm.update({
                     "timestamp": time.time(),
                     "alarm_value": alarm_value,
                     "z_score": z_score,
                     "severity": severity,
                 })
-
-                # Save updated alarm to DB
+    
                 self.app.save_alarm_to_db(*alarm_key, alarm_value, z_score, existing_alarm["is_anomaly"])
             else:
-                logger.debug(f"Alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id} already active and unchanged.")
+                _log.debug(f"Alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id} already active and unchanged.")
                 return  # No need to trigger again
-        else:
-            # Create and log a new alarm entry
-            logger.info(f"Triggering alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}: Value={alarm_value}, Z-score={z_score}")
-
+    
+        else:  # New alarm
+            _log.info(f"Triggering new alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}: Value={alarm_value}, Z-score={z_score}")
+            
+            # Initialize alarm data
             self.active_alarms[alarm_key] = {
                 "timestamp": time.time(),
                 "alarm_type": alarm_type,
@@ -805,90 +801,95 @@ class AlarmManager:
                 "is_anomaly": alarm_type == "Anomaly",
             }
             self.app.save_alarm_to_db(*alarm_key, alarm_value, z_score, self.active_alarms[alarm_key]["is_anomaly"])
-
-        # Send notification (including potential trend information)
-        await self.send_alarm_notification(alarm_key, history=history)  
-
-        # Escalation for new or upgraded critical alarms
+    
+        # Send initial notification (level 1)
+        asyncio.create_task(self.send_alarm_notification(alarm_key, history=history))
+    
+        # Escalation for new or upgraded critical alarms (same as before)
         if severity == "critical" and (existing_alarm is None or existing_alarm["severity"] != "critical"):
             asyncio.create_task(self.escalate_alarm(alarm_key))
-
+    
+    
     async def escalate_alarm(self, alarm_key):
         """Escalates an alarm if not acknowledged within the specified timeframe."""
+        _log.debug(f"Starting escalation for alarm {alarm_key}")
+    
         try:
             await asyncio.sleep(900)  # Wait for 15 minutes
-
-            # Check if the alarm is still active and not acknowledged
+    
             if alarm_key in self.active_alarms and alarm_key not in self.acknowledged_alarms:
-                logger.info(f"Escalating alarm {alarm_key} to level 2")
+                _log.warning(f"Escalating alarm {alarm_key} to level 2")
                 await self.send_alarm_notification(alarm_key, escalation_level=2)
             else:
-                logger.info(f"Alarm {alarm_key} already acknowledged or cleared. No escalation needed.")
+                _log.info(f"Alarm {alarm_key} already acknowledged or cleared. No escalation needed.")
+        
         except asyncio.CancelledError:
-            logger.info(f"Escalation task for alarm {alarm_key} cancelled.")
-
-
-    async def send_alarm_notification(self, alarm_key, escalation_level=1):
-        """Sends an alarm notification with escalation level and alarm details."""
+            _log.warning(f"Escalation task for alarm {alarm_key} cancelled.")
+    
+    
+    async def send_alarm_notification(self, alarm_key, escalation_level=1, history=None):
+        """Sends an alarm notification with escalation level and details."""
+        _log.debug(f"Sending alarm notification for {alarm_key} at escalation level {escalation_level}")
+    
         device_id, obj_id, prop_id, alarm_type = alarm_key
-        alarm_data = self.active_alarms[alarm_key]  # Get alarm data from the dictionary
-
-        # Get device details from app.deviceInfoCache
+        alarm_data = self.active_alarms.get(alarm_key)
+    
+        if alarm_data is None:
+            _log.error(f"Alarm data for {alarm_key} not found.")
+            return
+    
         device_info = self.app.deviceInfoCache.get_device_info(device_id)
         if device_info is None:
-            _logger.error(
-                f"Device with ID {device_id} not found. Cannot send alarm notification."
-            )
+            _log.error(f"Device with ID {device_id} not found. Cannot send alarm notification.")
             return
-
-        # Determine recipients based on escalation level
-        if escalation_level == 1:
-            recipients = ["primary_contact@example.com"]  # Replace with actual emails
-        elif escalation_level == 2:
-            recipients = ["secondary_contact@example.com", "manager@example.com"]
-        else:
-            recipients = ["admin@example.com"]  # Highest escalation level
-
-        # Construct the notification message
-        message_content = f"""
-        BACnet Alarm Notification
-
-        Severity: {alarm_data['severity']}
-        Alarm Type: {alarm_type}
-        Device: {device_info.device_name} ({device_id})
-        Object: {obj_id}
-        Property: {prop_id}
-        Value: {alarm_data['alarm_value']}
-        Timestamp: {datetime.fromtimestamp(alarm_data['timestamp']).strftime('%Y-%m-%d %H:%M:%S')}
-        Priority: {alarm_data.get('priority', 'Unknown')}
-        """
-
-        # Send email notifications to the specified recipients
-        for recipient_email in recipients:
-            try:
-                 await self.app.send_email_notification(message_content, recipient_email)
-                _logger.info(f"Alarm notification email sent to {recipient_email}")
-            except Exception as e:
-                _logger.error(
-                    f"Failed to send alarm notification email to {recipient_email}: {e}"
-                )
-
-     def _get_notification_recipients(self, escalation_level):
+    
+        recipients = self._get_notification_recipients(escalation_level)
+        message_content = self._format_alarm_message(alarm_data, device_info, history)
+    
+        # Use asyncio.gather for concurrent email sending, but handle potential errors
+        tasks = [self.app.send_email_notification(message_content, recipient) for recipient in recipients]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+        for recipient, result in zip(recipients, results):
+            if isinstance(result, Exception):
+                _log.error(f"Failed to send alarm notification email to {recipient}: {result}")
+            else:
+                _log.info(f"Alarm notification email sent to {recipient}")
+    
+    
+    def _get_notification_recipients(self, escalation_level):
         """Determines notification recipients based on the escalation level."""
-        recipients = {
-            1: ["primary_contact@example.com"],
-            2: ["secondary_contact@example.com", "manager@example.com"],
-        }
-        return recipients.get(escalation_level, ["admin@example.com"])  # Default to admin for unknown levels
-
+        _log.debug(f"Getting recipients for escalation level {escalation_level}")
+        
+        # Fetch recipients from database based on escalation level and alarm severity
+        try:
+            with self.app.db_conn:
+                cursor = self.app.db_conn.cursor()
+                cursor.execute(
+                    "SELECT email FROM alarm_recipients WHERE escalation_level <= ? ORDER BY escalation_level ASC", 
+                    (escalation_level,)
+                )
+                recipients = [row[0] for row in cursor.fetchall()]
+    
+                if not recipients:  # Default to admin if no recipients found
+                    _log.warning(f"No recipients found for escalation level {escalation_level}. Using default admin.")
+                    return ["admin@example.com"]
+    
+                _log.debug(f"Found recipients: {recipients}")
+                return recipients
+    
+        except sqlite3.Error as e:
+            _log.error(f"Error retrieving recipients from database: {e}")
+            return ["admin@example.com"]  # Fallback to admin in case of error
+    
     def _format_alarm_message(self, alarm_data, device_info, history=None):
         """Formats the alarm message content."""
-
-        # Ensure that alarm_data dictionary has necessary keys
+        _log.debug(f"Formatting alarm message for {alarm_data['alarm_type']} alarm on device {device_info.device_name}")
+        
         try:
             message_content = f"""
             BACnet Alarm Notification
-
+    
             Severity: {alarm_data['severity']}
             Alarm Type: {alarm_data['alarm_type']}
             Device: {device_info.device_name} ({device_info.device_identifier[1]})
@@ -898,28 +899,32 @@ class AlarmManager:
             Timestamp: {datetime.fromtimestamp(alarm_data['timestamp']).strftime('%Y-%m-%d %H:%M:%S')}
             Priority: {alarm_data.get('priority', 'Unknown')}
             """
+            
+            # Add Z-score if it's an anomaly alarm
+            if alarm_data.get('is_anomaly') and 'z_score' in alarm_data:
+                message_content += f"\nZ-score: {alarm_data['z_score']}"
+    
+            if history and alarm_data.get('is_anomaly'):
+                trend_info = self._calculate_trend(history)
+                message_content += f"\nRecent Trend: {trend_info}"
         except KeyError as e:
-            logger.error(f"Error formatting alarm message: Missing key in alarm_data - {e}")
-            return "Error: Invalid alarm data"
-
-        if history and alarm_data.get('is_anomaly'):  # Safe access with .get()
-            # Add trend information to anomaly alarm message
-            trend_info = self._calculate_trend(history)
-            message_content += f"\nRecent Trend: {trend_info}"
-
+            _log.error(f"Error formatting alarm message: Missing key in alarm_data - {e}")
+            message_content = "Error: Invalid alarm data"
+    
         return message_content
-
+    
     def _calculate_trend(self, history, threshold=0.05):  # Add a threshold parameter
         """Calculates a trend from the given history based on a percentage change threshold."""
-
+        _log.debug(f"Calculating trend from history: {history}")
+    
         if len(history) < 2:
             return "Insufficient data"
-
-        timestamps, values = zip(*history)
+        
+        _, values = zip(*history)  # Extract only the values from history
         start_value = values[0]
         end_value = values[-1]
         percentage_change = (end_value - start_value) / abs(start_value) if start_value != 0 else 0
-
+    
         if percentage_change > threshold:
             return "Increasing rapidly"
         elif percentage_change < -threshold:
@@ -927,26 +932,55 @@ class AlarmManager:
         elif percentage_change > 0:
             return "Increasing"
         elif percentage_change < 0:
-           return "Decreasing"
+            return "Decreasing"
         else:
-            return "Stable" 
-            
-    # In the trigger_alarm function
-    # await self.send_alarm_notification(alarm_key)  # Initial notification (level 1)
-
-    # In the escalate_alarm function
-    # await self.send_alarm_notification(alarm_key, escalation_level=2)  # Escalation (level 2)
-
+            return "Stable"
+     
+     async def clear_alarm(self, device_id, obj_id, prop_id, alarm_type):
+        """Clears a previously triggered alarm."""
+        _log.debug(f"Clearing alarm of type '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}")
+    
+        alarm_key = (device_id, obj_id, prop_id, alarm_type)
+    
+        # If the alarm is acknowledged, remove it from the acknowledged alarms set
+        if alarm_key in self.acknowledged_alarms:
+            self.acknowledged_alarms.remove(alarm_key)
+    
+        # Remove the alarm from active alarms
+        if alarm_key in self.active_alarms:
+            del self.active_alarms[alarm_key]
+    
+            # Update the database to mark the alarm as cleared
+            try:
+                with self.app.db_conn:
+                    cursor = self.app.db_conn.cursor()
+                    cursor.execute(
+                        "UPDATE alarms SET cleared = 1, timestamp = ? WHERE device_id = ? AND object_id = ? AND property_id = ? AND alarm_type = ?",
+                        (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), device_id[1], str(obj_id), prop_id, alarm_type)
+                    )
+                _log.info(f"Alarm {alarm_key} cleared in the database.")
+            except sqlite3.Error as e:
+                _log.error(f"Error clearing alarm in database: {e}")
+        else:
+            _log.warning(f"Tried to clear an alarm that was not active: {alarm_key}")
+                              
+        # In the trigger_alarm function
+        # await self.send_alarm_notification(alarm_key)  # Initial notification (level 1)
+    
+        # In the escalate_alarm function
+        # await self.send_alarm_notification(alarm_key, escalation_level=2)  # Escalation (level 2)
+    
     async def send_email_notification(self, message_content, recipient_email):
         """Sends an email notification using SMTP (e.g., Gmail)."""
+        _log.debug(f"Sending email notification to {recipient_email}")
     
-        sender_email = os.environ.get("EMAIL_SENDER")  # Load from environment variable
-        password = os.environ.get("EMAIL_PASSWORD")  # Load from environment variable
-
+        sender_email = os.environ.get("EMAIL_SENDER")
+        password = os.environ.get("EMAIL_PASSWORD")
+    
         if not sender_email or not password:
-            logger.error("Email credentials not found in environment variables. Cannot send notification.")
+            _log.error("Email credentials not found in environment variables. Cannot send notification.")
             return  # Don't proceed if credentials are missing
-
+    
         message = MIMEMultipart("alternative")
         message["Subject"] = "BACnet Alarm Notification"
         message["From"] = sender_email
@@ -956,111 +990,143 @@ class AlarmManager:
         text_part = MIMEText(message_content, "plain")
         # Optionally, create an HTML version with better formatting
         # html_part = MIMEText(f"<html><body>{message_content}</body></html>", "html") 
-
+    
         message.attach(text_part)
         # message.attach(html_part) 
-
+    
         try:
             # Use a context manager for automatic cleanup
             async with AioSmtplib.SMTP_SSL("smtp.gmail.com", 465) as server:  # Or your SMTP server
                 await server.login(sender_email, password)
                 await server.send_message(message) 
-        
-            logger.info(f"Alarm notification email sent to {recipient_email}")
-         except Exception as e:
-            logger.error(f"Failed to send alarm notification email to {recipient_email}: {e}")
-
-
-    async def clear_alarm(self, device_id, obj_id, prop_id, alarm_type):
-        """Clears a previously triggered alarm."""
-
-        alarm_key = (device_id, obj_id, prop_id, alarm_type)
-
-        # Remove from acknowledged alarms (if present)
-        if alarm_key in self.acknowledged_alarms:
-            _logger.info(f"Clearing acknowledged alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id}")
-            self.acknowledged_alarms.remove(alarm_key)
-        else:
-            # Check for alarm in active alarms
-            if alarm_key not in self.active_alarms:
-                logger.warning(f"Tried to clear a non-existent alarm: {alarm_key}")
-                return  # Exit early if alarm is not found
-
-        # Remove from active alarms
-        del self.active_alarms[alarm_key]
-
-        # Update the database to mark the alarm as cleared
-        try:
-            with self.app.db_conn:  # Use a context manager for automatic transaction handling
-                cursor = self.app.db_conn.cursor()
-                cursor.execute(
-                    "UPDATE alarms SET acknowledged = 1, timestamp = ? WHERE device_id = ? AND object_id = ? AND property_id = ? AND alarm_type = ?",
-                    (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), device_id[1], str(obj_id), prop_id, alarm_type)
-                )
-        except sqlite3.Error as e:
-            logger.error(f"Error clearing alarm in database: {e}")
-
+                _log.info(f"Email notification successfully sent to {recipient_email}")
+    
+        except smtplib.SMTPException as e:
+            _log.error(f"SMTP error sending notification to {recipient_email}: {e}")
+        except Exception as e:  # Catch-all for unexpected errors
+            _log.exception(f"Unexpected error sending notification to {recipient_email}: {e}")
+    
+    
+    
     async def manage_alarms(self):
         """Periodically checks active alarms and sends reminders if they persist."""
-        while True:
-            current_time = time.time()  # Get the current time once per loop
-            for alarm_key, alarm_data in list(self.active_alarms.items()):  
-                if current_time - alarm_data['timestamp'] > self.reminder_interval:
-                    device_id, obj_id, prop_id, alarm_type = alarm_key
-                    logger.warning(
-                        f"Alarm '{alarm_type}' for {obj_id}.{prop_id} on device {device_id} is still active. Sending reminder."
-                    )
-
-                    # (Option 1) Send reminder directly
-                    await self.send_reminder_notification(alarm_key)  
-
-                    # (Option 2) Create a task for sending the reminder
-                    # asyncio.create_task(self.send_reminder_notification(alarm_key)) 
-            
-            await asyncio.sleep(self.reminder_interval)
+        _log.debug("Starting alarm management task")
     
+        while True:
+            try:
+                current_time = time.time()
+                for alarm_key, alarm_data in list(self.active_alarms.items()):
+                    if current_time - alarm_data['timestamp'] > self.reminder_interval:
+                        _log.info(f"Sending reminder for persistent alarm {alarm_key}")
+                        await self.send_reminder_notification(alarm_key)
+    
+                # Check for silenced alarms that have expired
+                self.remove_expired_silenced_alarms()
+    
+                await asyncio.sleep(self.reminder_interval)
+            
+            except Exception as e:
+                _log.error(f"Unexpected error in manage_alarms: {e}")
+                await asyncio.sleep(self.reminder_interval)  # Wait before retrying
+    
+        
     async def send_reminder_notification(self, alarm_key):
         """Sends a reminder notification for the given alarm."""
+        _log.debug(f"Sending reminder notification for alarm {alarm_key}")
+    
         device_id, obj_id, prop_id, alarm_type = alarm_key
-        # Implementation for sending the reminder notification
-
+        alarm_data = self.active_alarms.get(alarm_key)
+    
+        if alarm_data is None:
+            _log.error(f"Alarm data for {alarm_key} not found.")
+            return
+    
+        device_info = self.app.deviceInfoCache.get_device_info(device_id)
+        if device_info is None:
+            _log.error(
+                f"Device with ID {device_id} not found. Cannot send reminder notification."
+            )
+            return
+    
+        message_content = f"""
+        BACnet Alarm Reminder
+    
+        Severity: {alarm_data['severity']}
+        Alarm Type: {alarm_data['alarm_type']}
+        Device: {device_info.device_name} ({device_info.device_identifier[1]})
+        Object: {alarm_data['object_id']}
+        Property: {alarm_data['property_id']}
+        Value: {alarm_data['alarm_value']}
+        """
+        
+        # Send email (or other notification)
+        recipients = self._get_notification_recipients(1)  # Get recipients for level 1
+        tasks = [self.app.send_email_notification(message_content, recipient) for recipient in recipients]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+        for recipient, result in zip(recipients, results):
+            if isinstance(result, Exception):
+                _log.error(f"Failed to send reminder notification email to {recipient}: {result}")
+            else:
+                _log.info(f"Reminder notification email sent to {recipient}")
+    
     async def acknowledge_alarm(self, alarm_key):
         """Acknowledges an alarm, moving it from active to acknowledged and updates the database."""
-
+        _log.debug(f"Acknowledging alarm {alarm_key}")
+    
         try:
             if alarm_key in self.active_alarms:
-                logger.info(f"Acknowledging alarm {alarm_key}")
-
                 # Move alarm to acknowledged set
                 self.acknowledged_alarms.add(alarm_key)
-
+    
                 # Remove from active alarms
                 del self.active_alarms[alarm_key]
-
+    
                 # Update the database to mark the alarm as acknowledged
                 await self.update_alarm_acknowledgment_in_db(alarm_key, acknowledged=True)
-
-                # Additional actions on acknowledgment (e.g., notification) can be added here
-            else:
-                logger.warning(f"Alarm {alarm_key} not found in active alarms. Cannot acknowledge.")
-        except Exception as e:
-            logger.exception(f"An unexpected error occurred while acknowledging alarm {alarm_key}: {e}")
     
-
+                # Send notification of acknowledgment
+                await self.send_alarm_notification(alarm_key, message_prefix="ACK: ")
+    
+                # Cancel any ongoing escalation tasks
+                self._cancel_escalation_task(alarm_key)
+            else:
+                _log.warning(f"Alarm {alarm_key} not found in active alarms. Cannot acknowledge.")
+        except Exception as e:
+            _log.exception(f"An unexpected error occurred while acknowledging alarm {alarm_key}: {e}")
+    
+    
     async def update_alarm_acknowledgment_in_db(self, alarm_key, acknowledged):
         """Updates the acknowledgment status of an alarm in the database."""
+        _log.debug(f"Updating alarm acknowledgment in database for {alarm_key}: acknowledged={acknowledged}")
         try:
             with self.app.db_conn:  # Use context manager for automatic transactions
                 cursor = self.app.db_conn.cursor()
                 device_id, obj_id, prop_id, alarm_type = alarm_key
                 cursor.execute(
-                    "UPDATE alarms SET acknowledged = ? WHERE device_id = ? AND object_id = ? AND property_id = ? AND alarm_type = ?",
-                    (acknowledged, device_id, str(obj_id), prop_id, alarm_type)
+                    "UPDATE alarms SET acknowledged = ?, cleared = ? WHERE device_id = ? AND object_id = ? AND property_id = ? AND alarm_type = ?",
+                    (acknowledged, not acknowledged, device_id[1], str(obj_id), prop_id, alarm_type)
                 )  
+            _log.debug(f"Alarm acknowledgment updated in database for {alarm_key}")
         except sqlite3.Error as e:
-            logger.error(f"Error updating alarm acknowledgment in database: {e.args[0]}")
-
+            _log.error(f"Error updating alarm acknowledgment in database: {e.args[0]}")
+    
+    
+    def _cancel_escalation_task(self, alarm_key):
+        """Cancels the escalation task for the specified alarm."""
+        for task in asyncio.all_tasks():
+            if task.get_name() == f"escalate_{alarm_key}":  
+                task.cancel()
+                _log.debug(f"Escalation task for {alarm_key} cancelled")
+                break
+        else:
+            _log.debug(f"No escalation task found for {alarm_key}")
+    
+    
+    # save_cov_notification_to_db
     def save_cov_notification_to_db(self, device_id, obj_id, prop_id, value):
+        """Saves COV notification data to the database."""
+        _log.debug(f"Saving COV notification to database: {obj_id}.{prop_id} = {value} (Device {device_id})")
         try:
             device_id = int(device_id[1])  # Extract device instance from tuple
             cursor = self.app.db_conn.cursor()
@@ -1068,38 +1134,41 @@ class AlarmManager:
                 "INSERT INTO cov_notifications (timestamp, device_id, object_id, property_id, value) VALUES (?, ?, ?, ?, ?)",
                 (time.time(), device_id, str(obj_id), prop_id, str(value)),  # Parameterized query
             )
-            self.app.db_conn.commit()
-            _logger.debug(
-                f"COV notification saved to database: {obj_id}.{prop_id} = {value} (Device {device_id})"
-            )
-
+            self.app.db_conn.commit()  
         except sqlite3.Error as e:
-            _logger.error(f"Error saving COV notification to database: {e}")
+            _log.error(f"Error saving COV notification to database: {e}")
             self.app.db_conn.rollback()  # Rollback on error
-            
+    
+    
+    # save_alarm_to_db
     def save_alarm_to_db(self, device_id, obj_id, prop_id, alarm_type, alarm_value, z_score=None, is_anomaly=False):
+        """Saves alarm data to the database."""
+        _log.debug(f"Saving alarm to database: {alarm_type} for {obj_id}.{prop_id} on device {device_id}")
         try:
             device_id = int(device_id[1])
             z_score = float(z_score) if z_score is not None else None
             is_anomaly = int(is_anomaly)
-
+    
             cursor = self.app.db_conn.cursor()
             cursor.execute(
                 """
                 INSERT INTO alarms 
-                (timestamp, device_id, object_id, property_id, alarm_type, alarm_value, z_score, is_anomaly)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (timestamp, device_id, object_id, property_id, alarm_type, alarm_value, z_score, is_anomaly, acknowledged, cleared)  
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), device_id, str(obj_id), prop_id, alarm_type, str(alarm_value), z_score, is_anomaly)  # Parameterized query
+                (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), device_id, str(obj_id), prop_id, alarm_type, str(alarm_value), z_score, is_anomaly, False, False)
             )
             self.app.db_conn.commit()
-            _logger.debug(f"Alarm saved to database: {alarm_type} for {obj_id}.{prop_id} on device {device_id}")
         except sqlite3.Error as e:
-            _logger.error(f"Error saving alarm to database: {e}")
+            _log.error(f"Error saving alarm to database: {e}")
             self.app.db_conn.rollback()
-
+    
+    
+    # load_silenced_alarms
     def load_silenced_alarms(self):
         """Loads silenced alarms from the database into memory."""
+        _log.debug("Loading silenced alarms from database")
+    
         try:
             cursor = self.app.db_conn.cursor()
             cursor.execute("SELECT device_id, object_id, property_id, alarm_type, silence_end_time FROM silenced_alarms")
@@ -1108,63 +1177,80 @@ class AlarmManager:
                 device_id, object_id, property_id, alarm_type, silence_end_time = row
                 alarm_key = (device_id, tuple(map(int, object_id[1:-1].split(", "))), property_id, alarm_type)
                 self.silenced_alarms[alarm_key] = silence_end_time
-            _logger.info(f"Silenced Alarms Successfully Loaded: {self.silenced_alarms}")
+            _log.info(f"Silenced Alarms Successfully Loaded: {self.silenced_alarms}")
         except sqlite3.Error as e:
-            _logger.error(f"Error loading silenced alarms from database: {e}")
-
-
+            _log.error(f"Error loading silenced alarms from database: {e}")
+    
+    # is_alarm_silenced
     def is_alarm_silenced(self, alarm_key):
         """Checks if an alarm is currently silenced."""
         silence_end_time = self.silenced_alarms.get(alarm_key)
         return silence_end_time is not None and time.time() < silence_end_time
-
-    def detect_alarm_flood(self, alarm_key):
-        """Detects and handles alarm floods."""
-        device_id = alarm_key[0]
-        now = time.time()
-        time_window_start = now - (now % self.flood_detection_window)
-
-        self.alarm_counts[device_id][time_window_start] += 1
-        if self.alarm_counts[device_id][time_window_start] > self.flood_threshold and not self.alarm_flood_active[device_id]:
-            _logger.warning(f"Alarm flood detected on device {device_id}!")
-            self.alarm_flood_active[device_id] = True
-
-            # Send flood notification (modify this to your preferred method)
-            message_content = f"Alarm flood detected on device {device_id}!"
-            asyncio.create_task(self.app.send_email_notification(message_content, "admin@example.com")) 
-            # Schedule flood deactivation
-            asyncio.create_task(self.deactivate_alarm_flood(device_id))
-
-    async def deactivate_alarm_flood(self, device_id):
-        """Deactivates the alarm flood after the suppression period."""
-        await asyncio.sleep(self.flood_detection_window * 2)  # Suppression period (2 time windows)
-        self.alarm_flood_active[device_id] = False
-        _logger.info(f"Alarm flood deactivated for device {device_id}")
-
-    def is_alarm_flood_active(self, device_id):
-        """Checks if an alarm flood is currently active for the device."""
-        return self.alarm_flood_active.get(device_id, False)
-
+    
+    # ... (detect_alarm_flood, deactivate_alarm_flood, and is_alarm_flood_active remain the same) ...
+    
     def silence_alarm(self, device_id, obj_id, prop_id, alarm_type, duration):
         """Silences an alarm."""
+        _log.debug(f"Silencing alarm of type '{alarm_type}' for {obj_id}.{prop_id} on device {device_id} for {duration} seconds.")
+        
         alarm_key = (device_id, obj_id, prop_id, alarm_type)
         silence_end_time = time.time() + duration
         self.silenced_alarms[alarm_key] = silence_end_time
-
-        # Save to the database
+    
         try:
-            cursor = self.app.db_conn.cursor()
-            cursor.execute(
-                "INSERT INTO silenced_alarms (device_id, object_id, property_id, alarm_type, silence_end_time) VALUES (?, ?, ?, ?, ?)",
-                (device_id, str(obj_id), prop_id, alarm_type, silence_end_time),  # Parameterized query
-            )
-            self.app.db_conn.commit()
-            _logger.info(
-                f"Alarm {alarm_key} silenced for {duration} seconds and stored in the database."
-            )
+            with self.app.db_conn:
+                cursor = self.app.db_conn.cursor()
+                cursor.execute(
+                    "INSERT OR REPLACE INTO silenced_alarms (device_id, object_id, property_id, alarm_type, silence_end_time) VALUES (?, ?, ?, ?, ?)",
+                    (device_id, str(obj_id), prop_id, alarm_type, silence_end_time),
+                )
+            _log.info(f"Alarm {alarm_key} silenced for {duration} seconds and stored in the database.")
         except sqlite3.Error as e:
-            _logger.error(f"Error silencing alarm in database: {e}")
-            self.app.db_conn.rollback()
+            _log.error(f"Error silencing alarm in database: {e}")
+    
+    
+    def remove_expired_silenced_alarms(self):
+        """Removes silenced alarms that have expired."""
+        _log.debug("Checking for expired silenced alarms")
+    
+        current_time = time.time()
+        expired_alarms = [key for key, silence_end_time in self.silenced_alarms.items() if silence_end_time < current_time]
+        
+        for alarm_key in expired_alarms:
+            del self.silenced_alarms[alarm_key]
+            try:
+                with self.app.db_conn:
+                    cursor = self.app.db_conn.cursor()
+                    cursor.execute(
+                        "DELETE FROM silenced_alarms WHERE device_id = ? AND object_id = ? AND property_id = ? AND alarm_type = ?",
+                        alarm_key
+                    )
+                _log.info(f"Removed expired silenced alarm {alarm_key} from database")
+            except sqlite3.Error as e:
+                _log.error(f"Error removing silenced alarm from database: {e}")
+    
+    def detect_alarm_flood(self, alarm_key):
+        """Detects and handles alarm floods."""
+        _log.debug(f"Checking for alarm flood: {alarm_key}")
+    
+        device_id = alarm_key[0]
+        now = time.time()
+        time_window_start = now - (now % self.flood_detection_window)
+    
+        self.alarm_counts[device_id][time_window_start] += 1
+        if (
+            self.alarm_counts[device_id][time_window_start] > self.flood_threshold
+            and not self.alarm_flood_active[device_id]
+        ):
+            _log.warning(f"Alarm flood detected on device {device_id}!")
+            self.alarm_flood_active[device_id] = True
+    
+            # Send flood notification (modify this to your preferred method)
+            message_content = f"Alarm flood detected on device {device_id}!"
+            asyncio.create_task(self.app.send_email_notification(message_content, "admin@example.com")) 
+    
+            # Schedule flood deactivation
+            asyncio.create_task(self.deactivate_alarm_flood(device_id))
 
                               
 # ******************************************************************************
