@@ -4,20 +4,11 @@
 
 # MIT License - 2024 by: eex0
 
-
 # Overall, this code serves as a robust foundation for building BACnet applications that require real-time monitoring 
 # and control of devices across potentially complex network topologies.
 # It can be customized and expanded to suit the specific requirements of various BACnet-based systems.
 
 # Notice: This is a work in progress, there ARE bugs here!
-
-# Overall, this code serves as a robust foundation for building BACnet applications that require real-time monitoring 
-# and control of devices across potentially complex network topologies.
-
-# It can be customized and expanded to suit the specific requirements of various BACnet-based systems.
-
-# This is a work in progress, there ARE bugs here!
-
 
 import asyncio
 import json
