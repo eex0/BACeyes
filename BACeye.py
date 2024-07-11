@@ -107,25 +107,31 @@ class Subscription:
 
 
     async def renew_subscription(self, app: BACeeApp, timeout: int = 5):
-        """Renews the COV subscription."""
+        """Renews the COV subscription, handling potential errors gracefully."""
+
+        subscription_info = f"{self.obj_id}.{self.prop_id}"  # For cleaner logging
+
         if not self.active:
-            _logger.warning(
-                f"Trying to renew an inactive subscription for {self.obj_id}.{self.prop_id}"
-            )
+            _log.warning(f"Attempting to renew inactive subscription: {subscription_info}")
             return
 
-        _logger.info(f"Renewing COV subscription for {self.obj_id}.{self.prop_id}")
+        _log.info(f"Renewing COV subscription: {subscription_info}")
 
         try:
-            # Use existing context manager
-            await app.subscribe_cov(self, renew=True)
+            await asyncio.wait_for(app.subscribe_cov(self, renew=True), timeout=timeout)
+            _log.info(f"Successfully renewed subscription: {subscription_info}")
 
-            _logger.info(f"Renewed COV subscription for {self.obj_id}.{self.prop_id}")
-        except (CommunicationError, TimeoutError, asyncio.TimeoutError) as e:
-            _logger.warning(
-                f"Error renewing subscription for {self.obj_id}.{self.prop_id}: {e}"
-            )
-            self.active = False  # Mark subscription as inactive on error
+        except asyncio.TimeoutError:
+            _log.error(f"Timeout renewing subscription: {subscription_info} after {timeout} seconds")
+            self.active = False
+
+        except CommunicationError as comm_err:
+            _log.error(f"Communication error renewing subscription: {subscription_info} - {comm_err}")
+            self.active = False  # Mark as inactive due to communication failure
+        
+        except Exception as e:  # Catch any unexpected errors
+            _log.exception(f"Unexpected error renewing subscription: {subscription_info} - {e}")
+            self.active = False 
 
 
                     
