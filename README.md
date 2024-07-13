@@ -1,7 +1,5 @@
-# BACeyepys
+# BACeye.py
 
-A Modular BACnet BBMD's communication and COV subscription management.
-
-uses: bacpypes - https://github.com/JoelBender/bacpypes
+uses: bacpypes - [https://github.com/JoelBender/bacpypes](https://github.com/JoelBender/BACpypes3/)
 
 Work in progress!
