@@ -1,54 +1,7 @@
 {
   "local_device": {
     "device_id": 12345,
-    "device_name": "BACeeGateway",
+    "device_name": "BACeyeGateway",
     "local_address": "192.168.1.100/24"
   },
-
-  "BBMDs": [
-    {
-      "name": "BuildingA-BBMD",
-      "address": "192.168.1.255",
-      "broadcastAddress": "255.255.255.255",
-      "isDefaultBBD": true 
-    },
-    {
-      "name": "BuildingB-BBMD",
-      "address": "192.168.2.255",
-      "broadcastAddress": "255.255.255.255"
-    }
-  ],
-
-  "subscriptions": [
-    {
-      "device_id": 54321,
-      "object_type": "analogInput",
-      "object_instance": 1,
-      "property_identifier": "presentValue",
-      "cov_increment": 1.0, 
-      "cov_increment_percentage": null,
-      "alarms": [
-        {
-          "type": "high",
-          "threshold": 80.0,
-          "severity": "major",
-          "priority": 1
-        },
-        {
-          "type": "low",
-          "threshold": 20.0,
-          "severity": "minor",
-          "priority": 10
-        }
-      ]
-    },
-    {
-      "device_id": 54322,
-      "object_type": "binaryInput",
-      "object_instance": 0,
-      "property_identifier": "presentValue",
-      "cov_increment": null,  
-      "cov_increment_percentage": 10  
-    }
-  ]
 }
