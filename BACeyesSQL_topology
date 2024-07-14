@@ -67,7 +67,7 @@ points
     ├── offlineMeter
     └── dateCreated
 
-sites
+BACnet Data
 ├── device_id (PK)
 ├── object_name
 ├── object_type (always "device")
