@@ -101,3 +101,33 @@ BACnet Data
 ├── utc_offset
 └── daylight_savings_status
 
+Property	                    Description
+object-identifier	            This uniquely identifies the BACnet device itself and is the primary key.
+object-name	                    A human-readable name for the device.
+object-type	                    Always "device" since this table is specifically for devices.
+vendor-name	                    The name of the device manufacturer.
+vendor-identifier	            A numerical code to identify the vendor.
+model-name	                    The specific model of the device.
+firmware-revision	            The version of the device's firmware.
+application-software-version    The version of the application software running on the device.
+protocol-revision	            The version of the BACnet protocol supported by the device.
+protocol-services-supported	    An array of the BACnet services supported by the device.
+protocol-object-types-supported	An array of the BACnet object types supported by the device.
+object-list	                    A JSONB array listing the object identifiers of all objects present on the device.
+max-apdu-length-accepted	    The maximum APDU size the device accepts.
+segmentation-supported	        Whether the device supports BACnet segmentation (larger messages).
+number-of-apdu-retries	        Number of APDU transmission retries.
+apdu-segment-timeout	        Timeout (in ms) for a segment of a segmented APDU.
+apdu-timeout	                Timeout (in ms) for a response to an APDU.
+local-date, local-time	        Current date and time on the device.
+system-status	                Operational status of the device.
+database-revision	            A counter that increments with changes to the device's object database.
+location	                    Physical location of the device (if available).
+description	                    Detailed description of the device (if available).
+max-master	                    Maximum number of masters on an MS/TP network (relevant for MS/TP devices only).
+max-info-frames	                Maximum number of information frames for an MS/TP device (relevant for MS/TP devices only).
+device-address-binding	        List of bindings between this device and others.
+configuration-files	            List of configuration files on the device (if available).
+time-synchronization-recipients	List of devices to which the device can send time sync requests.
+utc-offset	                    Device's time offset from UTC.
+daylight-savings-status	        Indicates if the device is observing daylight saving time.
