@@ -1,0 +1,101 @@
+===========================
+SQL construct consideration
+===========================
+
+sites
+├── site_id (PK)
+├── name
+├── address
+├── city
+├── state
+├── postal_code
+├── country
+├── latitude
+├── longitude
+├── elevation
+├── area
+├── timezone
+├── weather_station_id (FK)
+├── year_built
+├── primary_function
+└── custom_data (JSONB)
+    ├── equipType
+    └── elecFreq
+
+equipment
+├── equipment_id (PK)
+├── site_id (FK)
+├── name
+├── parent_equipment_id (FK)
+├── space_ref
+├── equipment_type
+├── hot_water_system_id (FK)
+├── chilled_water_system_id (FK)
+└── custom_data (JSONB)
+    ├── designSource
+    ├── designHotWaterPower
+    ├── designMake
+    ├── designModel
+    └── designChilledWaterPower
+
+points
+├── point_id (PK)
+├── equipment_id (FK)
+├── site_id (FK)
+├── name
+├── data_type
+├── point_type
+├── unit
+├── timezone
+├── measurement_type
+└── custom_data (JSONB)
+    ├── predictionConf
+    ├── sourcePointName
+    ├── dataSyncRecovered
+    ├── inScope
+    ├── backgroundPoint
+    ├── precision
+    ├── dataSyncDownSince
+    ├── dataSyncType
+    ├── pointType
+    ├── max
+    ├── min
+    ├── firingRate
+    ├── act
+    ├── capacity
+    ├── lockout
+    ├── offlineMeter
+    └── dateCreated
+
+sites
+├── device_id (PK)
+├── object_name
+├── object_type (always "device")
+├── vendor_name
+├── vendor_identifier
+├── model_name
+├── firmware_revision
+├── application_software_version
+├── protocol_revision
+├── protocol_services_supported
+├── protocol_object_types_supported
+├── object_list
+├── max_apdu_length_accepted
+├── segmentation_supported
+├── number_of_apdu_retries
+├── apdu_segment_timeout
+├── apdu_timeout
+├── local_date
+├── local_time
+├── system_status
+├── database_revision
+├── location
+├── description
+├── max_master (MS/TP only)
+├── max_info_frames (MS/TP only)
+├── device_address_binding
+├── configuration_files
+├── time_synchronization_recipients
+├── utc_offset
+└── daylight_savings_status
+
